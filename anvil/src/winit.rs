@@ -159,7 +159,7 @@ pub fn run_winit(log: Logger) {
     let start_time = std::time::Instant::now();
 
     #[cfg(feature = "xwayland")]
-    state.start_xwayland();
+    state.start_xwayland(&mut display);
 
     info!(log, "Initialization completed, starting the main loop.");
 
