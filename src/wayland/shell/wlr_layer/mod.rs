@@ -186,7 +186,7 @@ impl WlrLayerShellState {
     /// Access all the shell surfaces known by this handler
     pub fn layer_surfaces(&self) -> &[LayerSurface] {
         // &self.known_layers[..]
-        todo!()
+        &[] // TODO!
     }
 }
 
