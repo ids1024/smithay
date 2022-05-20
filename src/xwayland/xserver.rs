@@ -55,7 +55,10 @@ use calloop::{
     generic::{Fd, Generic},
     Interest, LoopHandle, Mode, Poll, PostAction, Readiness, Token, TokenFactory,
 };
-use wayland_server::{Client, Display, backend::{ClientData, ClientId, DisconnectReason}};
+use wayland_server::{
+    backend::{ClientData, ClientId, DisconnectReason},
+    Client, Display,
+};
 
 use slog::{error, info, o};
 
@@ -85,6 +88,9 @@ pub enum XWaylandEvent {
 
         /// Wayland client representing XWayland
         client: Client,
+
+        /// Wayland client file descriptor in case you are not using the display's poll_fd
+        client_fd: RawFd,
 
         /// The display number the XWayland server is available at.
         ///
@@ -127,7 +133,7 @@ impl XWayland {
     /// wayland `Client` for XWayland.
     ///
     /// Does nothing if XWayland is already started or starting.
-    pub fn start<D>(&self, loop_handle: LoopHandle<'_, D>, display: &mut Display<D>) -> io::Result<()> {
+    pub fn start<C, D>(&self, loop_handle: LoopHandle<'_, C>, display: &mut Display<D>) -> io::Result<()> {
         launch(&self.inner, loop_handle, display)
     }
 
@@ -150,6 +156,7 @@ impl Drop for XWayland {
 struct XWaylandInstance {
     display_lock: X11Lock,
     wayland_client: Option<Client>,
+    wayland_client_fd: Option<RawFd>,
     wm_fd: Option<UnixStream>,
     child_stdout: ChildStdout,
 }
@@ -181,7 +188,11 @@ impl ClientData for XWaylandClientData {
 // Launch an XWayland server
 //
 // Does nothing if there is already a launched instance
-fn launch<D>(inner: &Arc<Mutex<Inner>>, loop_handle: LoopHandle<'_, D>, display: &mut Display<D>) -> io::Result<()> {
+fn launch<C, D>(
+    inner: &Arc<Mutex<Inner>>,
+    loop_handle: LoopHandle<'_, C>,
+    display: &mut Display<D>,
+) -> io::Result<()> {
     let mut guard = inner.lock().unwrap();
     if guard.instance.is_some() {
         return Ok(());
@@ -215,10 +226,12 @@ fn launch<D>(inner: &Arc<Mutex<Inner>>, loop_handle: LoopHandle<'_, D>, display:
         },
     )?;
 
+    let client_fd = wl_me.as_raw_fd();
     let client = display.insert_client(wl_me, Arc::new(XWaylandClientData { inner: inner.clone() }))?;
     guard.instance = Some(XWaylandInstance {
         display_lock: lock,
         wayland_client: Some(client),
+        wayland_client_fd: Some(client_fd),
         wm_fd: Some(x_wm_me),
         child_stdout,
     });
@@ -275,8 +288,11 @@ impl Inner {
     // Shutdown the XWayland server and cleanup everything
     fn shutdown(&mut self) {
         // don't do anything if not running
-        if self.instance.take().is_some() {
+        if let Some(instance) = self.instance.take() {
             info!(self.log, "Shutting down XWayland.");
+            if let Some(_client) = instance.wayland_client {
+                //client.kill(); // TODO, needs `DisplayHandle` right now
+            }
 
             // send error occurs if the user dropped the channel... We cannot do much except ignore.
             let _ = self.sender.send(XWaylandEvent::Exited);
@@ -297,6 +313,7 @@ fn xwayland_ready(inner: &Arc<Mutex<Inner>>) {
     // Lots of re-borrowing to please the borrow-checker
     let mut guard = inner.lock().unwrap();
     let guard = &mut *guard;
+    info!(guard.log, "XWayland ready");
     // instance should never be None at this point
     let instance = guard.instance.as_mut().unwrap();
     // neither the child_stdout
@@ -325,7 +342,8 @@ fn xwayland_ready(inner: &Arc<Mutex<Inner>>) {
         // send error occurs if the user dropped the channel... We cannot do much except ignore.
         let _ = guard.sender.send(XWaylandEvent::Ready {
             connection: instance.wm_fd.take().unwrap(), // This is a bug if None
-            client: instance.wayland_client.take().unwrap(),
+            client: instance.wayland_client.take().unwrap(), // TODO: .clone().unwrap(),
+            client_fd: instance.wayland_client_fd.take().unwrap(),
             display: instance.display_lock.display(),
         });
     } else {
@@ -352,7 +370,7 @@ fn spawn_xwayland(
 
     let mut xwayland_args = format!(":{} -rootless -terminate -wm {}", display, wm_socket.as_raw_fd());
     for socket in listen_sockets {
-        xwayland_args.push_str(&format!(" -listen {}", socket.as_raw_fd()));
+        xwayland_args.push_str(&format!(" -listenfd {}", socket.as_raw_fd()));
     }
     // This command let sh to:
     // * Set up signal handler for USR1
