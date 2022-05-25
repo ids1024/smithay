@@ -12,13 +12,13 @@ use smithay::{
     },
     desktop::{layer_map_for_output, WindowSurfaceType},
     reexports::wayland_server::{
-        DisplayHandle,
         protocol::{wl_pointer, wl_surface::WlSurface},
+        DisplayHandle,
     },
     utils::{Logical, Point},
     wayland::{
         compositor::with_states,
-        seat::{keysyms as xkb, AxisFrame, ButtonEvent, MotionEvent, FilterResult, Keysym, ModifiersState},
+        seat::{keysyms as xkb, AxisFrame, ButtonEvent, FilterResult, Keysym, ModifiersState, MotionEvent},
         shell::wlr_layer::{KeyboardInteractivity, Layer as WlrLayer, LayerSurfaceCachedState},
         Serial, SERIAL_COUNTER as SCOUNTER,
     },
@@ -30,15 +30,12 @@ use smithay::{backend::input::PointerMotionAbsoluteEvent, wayland::output::Outpu
 #[cfg(feature = "udev")]
 use crate::state::Backend;
 #[cfg(feature = "udev")]
-use smithay::{
-    backend::{
-        input::{
-            Device, DeviceCapability, PointerMotionEvent, ProximityState, TabletToolButtonEvent,
-            TabletToolEvent, TabletToolProximityEvent, TabletToolTipEvent, TabletToolTipState,
-        },
-        session::Session,
+use smithay::backend::{
+    input::{
+        Device, DeviceCapability, PointerMotionEvent, ProximityState, TabletToolButtonEvent, TabletToolEvent,
+        TabletToolProximityEvent, TabletToolTipEvent, TabletToolTipState,
     },
-    //wayland::tablet_manager::{TabletDescriptor, TabletSeatTrait},
+    session::Session,
 };
 
 impl<Backend> AnvilState<Backend> {
@@ -70,7 +67,11 @@ impl<Backend> AnvilState<Backend> {
         }
     }
 
-    fn keyboard_key_to_action<B: InputBackend>(&mut self, dh: &DisplayHandle, evt: B::KeyboardKeyEvent) -> KeyAction {
+    fn keyboard_key_to_action<B: InputBackend>(
+        &mut self,
+        dh: &DisplayHandle,
+        evt: B::KeyboardKeyEvent,
+    ) -> KeyAction {
         let keycode = evt.key_code();
         let state = evt.state();
         debug!(self.log, "key"; "keycode" => keycode, "state" => format!("{:?}", state));
@@ -80,22 +81,15 @@ impl<Backend> AnvilState<Backend> {
         let suppressed_keys = &mut self.suppressed_keys;
         let keyboard = self.seat.get_keyboard().unwrap();
 
-        for layer in self
-            .layer_shell_state
-            .layer_surfaces()
-            .iter()
-            .rev()
-        {
+        for layer in self.layer_shell_state.layer_surfaces().iter().rev() {
             let data = with_states(layer.wl_surface(), |states| {
                 *states.cached_state.current::<LayerSurfaceCachedState>()
             });
             if data.keyboard_interactivity == KeyboardInteractivity::Exclusive
                 && (data.layer == WlrLayer::Top || data.layer == WlrLayer::Overlay)
             {
-                keyboard
-                    .set_focus(dh, Some(layer.wl_surface()), serial);
-                keyboard
-                    .input::<(), _>(dh, keycode, state, serial, time, |_, _| FilterResult::Forward);
+                keyboard.set_focus(dh, Some(layer.wl_surface()), serial);
+                keyboard.input::<(), _>(dh, keycode, state, serial, time, |_, _| FilterResult::Forward);
                 return KeyAction::None;
             }
         }
@@ -149,12 +143,16 @@ impl<Backend> AnvilState<Backend> {
         if wl_pointer::ButtonState::Pressed == state {
             self.update_keyboard_focus(dh, serial);
         };
-        self.seat.get_pointer().unwrap().button(self, dh, &ButtonEvent {
-            button,
-            state,
-            serial,
-            time: evt.time(),
-        });
+        self.seat.get_pointer().unwrap().button(
+            self,
+            dh,
+            &ButtonEvent {
+                button,
+                state,
+                serial,
+                time: evt.time(),
+            },
+        );
     }
 
     fn update_keyboard_focus(&mut self, dh: &DisplayHandle, serial: Serial) {
@@ -315,11 +313,21 @@ impl<Backend> AnvilState<Backend> {
 
 #[cfg(any(feature = "winit", feature = "x11"))]
 impl<Backend: crate::state::Backend> AnvilState<Backend> {
-    pub fn process_input_event_windowed<B: InputBackend>(&mut self, dh: &DisplayHandle, event: InputEvent<B>, output_name: &str) {
+    pub fn process_input_event_windowed<B: InputBackend>(
+        &mut self,
+        dh: &DisplayHandle,
+        event: InputEvent<B>,
+        output_name: &str,
+    ) {
         match event {
             InputEvent::Keyboard { event } => match self.keyboard_key_to_action::<B>(dh, event) {
                 KeyAction::ScaleUp => {
-                    let output = self.space.outputs().find(|o| o.name() == output_name).unwrap().clone();
+                    let output = self
+                        .space
+                        .outputs()
+                        .find(|o| o.name() == output_name)
+                        .unwrap()
+                        .clone();
 
                     let geometry = self.space.output_geometry(&output).unwrap();
                     let current_scale = self.space.output_scale(&output).unwrap();
@@ -332,7 +340,12 @@ impl<Backend: crate::state::Backend> AnvilState<Backend> {
                 }
 
                 KeyAction::ScaleDown => {
-                    let output = self.space.outputs().find(|o| o.name() == output_name).unwrap().clone();
+                    let output = self
+                        .space
+                        .outputs()
+                        .find(|o| o.name() == output_name)
+                        .unwrap()
+                        .clone();
 
                     let geometry = self.space.output_geometry(&output).unwrap();
                     let current_scale = self.space.output_scale(&output).unwrap();
@@ -384,12 +397,16 @@ impl<Backend: crate::state::Backend> AnvilState<Backend> {
         let serial = SCOUNTER.next_serial();
 
         let under = self.surface_under();
-        self.seat.get_pointer().unwrap().motion(self, dh, &MotionEvent {
-            location: pos,
-            focus: under,
-            serial,
-            time: evt.time()
-        });
+        self.seat.get_pointer().unwrap().motion(
+            self,
+            dh,
+            &MotionEvent {
+                location: pos,
+                focus: under,
+                serial,
+                time: evt.time(),
+            },
+        );
     }
 }
 
