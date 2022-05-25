@@ -244,7 +244,7 @@ pub fn run_winit(log: Logger) {
             let render_res = backend.bind().and_then(|_| {
                 let renderer = backend.renderer();
                 crate::render::render_output(
-                    &mut display.handle(),
+                    &display.handle(),
                     &output,
                     space,
                     renderer,
@@ -285,7 +285,7 @@ pub fn run_winit(log: Logger) {
         if result.is_err() {
             state.running.store(false, Ordering::SeqCst);
         } else {
-            state.space.refresh(&mut display.handle());
+            state.space.refresh(&display.handle());
             state.popups.cleanup();
             display.flush_clients().unwrap();
         }
