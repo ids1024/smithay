@@ -70,7 +70,7 @@ impl<Backend> AnvilState<Backend> {
         }
     }
 
-    fn keyboard_key_to_action<B: InputBackend>(&mut self, dh: &mut DisplayHandle<'_>, evt: B::KeyboardKeyEvent) -> KeyAction {
+    fn keyboard_key_to_action<B: InputBackend>(&mut self, dh: &DisplayHandle, evt: B::KeyboardKeyEvent) -> KeyAction {
         let keycode = evt.key_code();
         let state = evt.state();
         debug!(self.log, "key"; "keycode" => keycode, "state" => format!("{:?}", state));
@@ -138,7 +138,7 @@ impl<Backend> AnvilState<Backend> {
             .unwrap_or(KeyAction::None)
     }
 
-    fn on_pointer_button<B: InputBackend>(&mut self, dh: &mut DisplayHandle<'_>, evt: B::PointerButtonEvent) {
+    fn on_pointer_button<B: InputBackend>(&mut self, dh: &DisplayHandle, evt: B::PointerButtonEvent) {
         let serial = SCOUNTER.next_serial();
         let button = evt.button_code();
         let state = match evt.state() {
@@ -157,7 +157,7 @@ impl<Backend> AnvilState<Backend> {
         });
     }
 
-    fn update_keyboard_focus(&mut self, dh: &mut DisplayHandle<'_>, serial: Serial) {
+    fn update_keyboard_focus(&mut self, dh: &DisplayHandle, serial: Serial) {
         // change the keyboard focus unless the pointer is grabbed
         let pointer = self.seat.get_pointer().unwrap();
         let keyboard = self.seat.get_keyboard().unwrap();
@@ -275,7 +275,7 @@ impl<Backend> AnvilState<Backend> {
         under
     }
 
-    fn on_pointer_axis<B: InputBackend>(&mut self, dh: &mut DisplayHandle<'_>, evt: B::PointerAxisEvent) {
+    fn on_pointer_axis<B: InputBackend>(&mut self, dh: &DisplayHandle, evt: B::PointerAxisEvent) {
         let source = match evt.source() {
             input::AxisSource::Continuous => wl_pointer::AxisSource::Continuous,
             input::AxisSource::Finger => wl_pointer::AxisSource::Finger,
@@ -315,7 +315,7 @@ impl<Backend> AnvilState<Backend> {
 
 #[cfg(any(feature = "winit", feature = "x11"))]
 impl<Backend: crate::state::Backend> AnvilState<Backend> {
-    pub fn process_input_event_windowed<B: InputBackend>(&mut self, dh: &mut DisplayHandle<'_>, event: InputEvent<B>, output_name: &str) {
+    pub fn process_input_event_windowed<B: InputBackend>(&mut self, dh: &DisplayHandle, event: InputEvent<B>, output_name: &str) {
         match event {
             InputEvent::Keyboard { event } => match self.keyboard_key_to_action::<B>(dh, event) {
                 KeyAction::ScaleUp => {
@@ -324,7 +324,7 @@ impl<Backend: crate::state::Backend> AnvilState<Backend> {
                     let geometry = self.space.output_geometry(&output).unwrap();
                     let current_scale = self.space.output_scale(&output).unwrap();
                     let new_scale = current_scale + 0.25;
-                    output.change_current_state(dh, None, None, Some(new_scale.ceil() as i32), None);
+                    output.change_current_state(None, None, Some(new_scale.ceil() as i32), None);
                     self.space.map_output(&output, new_scale, geometry.loc);
 
                     crate::shell::fixup_positions(dh, &mut self.space);
@@ -337,7 +337,7 @@ impl<Backend: crate::state::Backend> AnvilState<Backend> {
                     let geometry = self.space.output_geometry(&output).unwrap();
                     let current_scale = self.space.output_scale(&output).unwrap();
                     let new_scale = f64::max(1.0, current_scale - 0.25);
-                    output.change_current_state(dh, None, None, Some(new_scale.ceil() as i32), None);
+                    output.change_current_state(None, None, Some(new_scale.ceil() as i32), None);
                     self.space.map_output(&output, new_scale, geometry.loc);
 
                     crate::shell::fixup_positions(dh, &mut self.space);
@@ -373,7 +373,7 @@ impl<Backend: crate::state::Backend> AnvilState<Backend> {
 
     fn on_pointer_move_absolute_windowed<B: InputBackend>(
         &mut self,
-        dh: &mut DisplayHandle<'_>,
+        dh: &DisplayHandle,
         evt: B::PointerMotionAbsoluteEvent,
         output: &Output,
     ) {

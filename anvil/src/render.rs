@@ -12,7 +12,7 @@ use smithay::{
 use crate::{drawing::*, shell::FullscreenSurface};
 
 pub fn render_output<R, E>(
-    dh: &mut DisplayHandle<'_>,
+    dh: &mut DisplayHandle,
     output: &Output,
     space: &mut Space,
     renderer: &mut R,

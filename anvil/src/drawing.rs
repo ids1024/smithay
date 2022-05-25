@@ -103,7 +103,7 @@ where
 
     fn draw(
         &self,
-        dh: &mut DisplayHandle<'_>,
+        dh: &DisplayHandle,
         _renderer: &mut R,
         frame: &mut <R as Renderer>::Frame,
         scale: f64,
