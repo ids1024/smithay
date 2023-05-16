@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DND_ICON_ROLE"],"fn":["default_action_chooser","set_data_device_focus","set_data_device_selection","start_dnd","with_source_metadata"],"struct":["DataDeviceState","SourceMetadata"],"trait":["ClientDndGrabHandler","DataDeviceHandler","ServerDndGrabHandler"]};
