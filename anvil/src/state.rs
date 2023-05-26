@@ -1,5 +1,5 @@
 use std::{
-    os::unix::io::{AsRawFd, OwnedFd},
+    os::unix::io::{AsRawFd, BorrowedFd, OwnedFd},
     sync::{atomic::AtomicBool, Arc, Mutex},
     time::Duration,
 };
@@ -462,18 +462,12 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         } else {
             None
         };
+        let fd = unsafe { BorrowedFd::borrow_raw(display.backend().poll_fd().as_raw_fd()) }; // XXX
         handle
-            .insert_source(
-                Generic::new(
-                    display.backend().poll_fd().as_raw_fd(),
-                    Interest::READ,
-                    Mode::Level,
-                ),
-                |_, _, data| {
-                    data.display.dispatch_clients(&mut data.state).unwrap();
-                    Ok(PostAction::Continue)
-                },
-            )
+            .insert_source(Generic::new(fd, Interest::READ, Mode::Level), |_, _, data| {
+                data.display.dispatch_clients(&mut data.state).unwrap();
+                Ok(PostAction::Continue)
+            })
             .expect("Failed to init wayland server source");
 
         // init globals

@@ -43,7 +43,7 @@ use std::{
     ffi::OsStr,
     io::{self, Read},
     os::unix::{
-        io::{AsRawFd, RawFd},
+        io::{AsRawFd, BorrowedFd, RawFd},
         net::UnixStream,
         process::CommandExt,
     },
@@ -278,9 +278,10 @@ where
     };
 
     let loop_inner = inner.clone();
+    let fd = unsafe { BorrowedFd::borrow_raw(child_stdout.as_raw_fd()) }; // XXX
     loop_handle
         .insert_source(
-            Generic::<_, io::Error>::new(child_stdout.as_raw_fd(), Interest::READ, Mode::Level),
+            Generic::<_, io::Error>::new(fd, Interest::READ, Mode::Level),
             move |_, _, _| {
                 // the closure must be called exactly one time, this cannot panic
                 xwayland_ready(&loop_inner);

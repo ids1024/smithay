@@ -19,7 +19,7 @@ use crate::utils::{Buffer as BufferCoords, Size};
 #[cfg(feature = "wayland_frontend")]
 use crate::wayland::compositor::{Blocker, BlockerState};
 use std::hash::{Hash, Hasher};
-use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::{error, fmt};
@@ -339,8 +339,8 @@ impl Blocker for DmabufBlocker {
 
 #[derive(Debug)]
 enum Subsource {
-    Active(Generic<RawFd, std::io::Error>),
-    Done(Generic<RawFd, std::io::Error>),
+    Active(Generic<BorrowedFd<'static>, std::io::Error>),
+    Done(Generic<BorrowedFd<'static>, std::io::Error>),
     Empty,
 }
 
@@ -394,11 +394,11 @@ impl DmabufSource {
         ];
         for (idx, handle) in dmabuf.handles().enumerate() {
             // SAFETY: This is stored together with the Dmabuf holding the owned file descriptors
-            let fd = handle.as_raw_fd();
+            let fd = unsafe { BorrowedFd::borrow_raw(handle.as_raw_fd()) };
             if matches!(
                 poll::poll(
                     &mut [poll::PollFd::new(
-                        fd,
+                        fd.as_raw_fd(),
                         if interest.writable {
                             poll::PollFlags::POLLOUT
                         } else {

@@ -7,7 +7,7 @@ use libseat::{Seat, SeatEvent};
 use std::{
     cell::RefCell,
     collections::HashMap,
-    os::unix::io::RawFd,
+    os::unix::io::{AsRawFd, BorrowedFd, RawFd},
     path::Path,
     rc::{Rc, Weak},
     sync::{
@@ -129,7 +129,7 @@ impl Session for LibSeatSession {
                 .open_device(&path)
                 .map(|(id, fd)| {
                     session.devices.borrow_mut().insert(fd, id);
-                    fd
+                    fd.as_raw_fd()
                 })
                 .map_err(|err| Error::FailedToOpenDevice(Errno::from_i32(err.into())))
         } else {
@@ -198,6 +198,11 @@ impl LibSeatSessionNotifier {
             span: self.span.clone(),
         }
     }
+
+    fn get_fd(&self) -> BorrowedFd<'_> {
+        let fd = self.internal.seat.borrow_mut().get_fd().unwrap();
+        unsafe { BorrowedFd::borrow_raw(fd) }
+    }
 }
 
 impl EventSource for LibSeatSessionNotifier {
@@ -245,7 +250,7 @@ impl EventSource for LibSeatSessionNotifier {
 
         self.token = Some(factory.token());
         poll.register(
-            self.internal.seat.borrow_mut().get_fd().unwrap(),
+            self.get_fd(),
             calloop::Interest::READ,
             calloop::Mode::Level,
             self.token.unwrap(),
@@ -257,7 +262,7 @@ impl EventSource for LibSeatSessionNotifier {
 
         self.token = Some(factory.token());
         poll.reregister(
-            self.internal.seat.borrow_mut().get_fd().unwrap(),
+            self.get_fd(),
             calloop::Interest::READ,
             calloop::Mode::Level,
             self.token.unwrap(),
@@ -268,7 +273,7 @@ impl EventSource for LibSeatSessionNotifier {
         self.rx.unregister(poll)?;
 
         self.token = None;
-        poll.unregister(self.internal.seat.borrow_mut().get_fd().unwrap())
+        poll.unregister(self.get_fd())
     }
 }
 
