@@ -44,7 +44,7 @@ use smithay::{
         },
         dmabuf::DmabufFeedback,
         fractional_scale::{with_fractional_scale, FractionalScaleHandler, FractionalScaleManagerState},
-        input_method::InputMethodManagerState,
+        input_method::{InputMethodManagerState, InputMethodSeat},
         keyboard_shortcuts_inhibit::{
             KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState, KeyboardShortcutsInhibitor,
         },
@@ -261,8 +261,9 @@ impl<BackendData: Backend> SeatHandler for AnvilState<BackendData> {
         set_primary_focus(dh, seat, focus);
 
         let text_input = seat.text_input();
+        let input_method = seat.input_method();
         let surface = target.and_then(WaylandFocus::wl_surface);
-        text_input.set_focus(surface.as_ref(), || {});
+        text_input.set_focus(surface.as_ref(), || input_method.close_popup());
     }
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         *self.cursor_status.lock().unwrap() = image;
