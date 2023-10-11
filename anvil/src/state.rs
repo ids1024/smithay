@@ -14,8 +14,9 @@ use smithay::{
     delegate_input_method_manager, delegate_keyboard_shortcuts_inhibit, delegate_layer_shell,
     delegate_output, delegate_pointer_constraints, delegate_pointer_gestures, delegate_presentation,
     delegate_primary_selection, delegate_relative_pointer, delegate_seat, delegate_security_context,
-    delegate_shm, delegate_tablet_manager, delegate_text_input_manager, delegate_viewporter,
-    delegate_virtual_keyboard_manager, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_session_lock, delegate_shm, delegate_tablet_manager, delegate_text_input_manager,
+    delegate_viewporter, delegate_virtual_keyboard_manager, delegate_xdg_activation, delegate_xdg_decoration,
+    delegate_xdg_shell,
     desktop::{
         space::SpaceElement,
         utils::{
@@ -37,7 +38,7 @@ use smithay::{
         },
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason},
-            protocol::{wl_data_source::WlDataSource, wl_surface::WlSurface},
+            protocol::{wl_data_source::WlDataSource, wl_output::WlOutput, wl_surface::WlSurface},
             Display, DisplayHandle, Resource,
         },
     },
@@ -68,6 +69,7 @@ use smithay::{
             wlr_data_control::{DataControlHandler, DataControlState},
             SelectionHandler,
         },
+        session_lock::{surface::LockSurface, SessionLockHandler, SessionLockManagerState, SessionLocker},
         shell::{
             wlr_layer::WlrLayerShellState,
             xdg::{
@@ -144,6 +146,7 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub xdg_shell_state: XdgShellState,
     pub presentation_state: PresentationState,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
+    pub session_lock_manager_state: SessionLockManagerState,
 
     pub dnd_icon: Option<WlSurface>,
 
@@ -488,6 +491,17 @@ impl<BackendData: Backend + 'static> SecurityContextHandler for AnvilState<Backe
     }
 }
 delegate_security_context!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
+
+impl<BackendData: Backend + 'static> SessionLockHandler for AnvilState<BackendData> {
+    fn lock_state(&mut self) -> &mut SessionLockManagerState {
+        &mut self.session_lock_manager_state
+    }
+    fn lock(&mut self, _: SessionLocker) {}
+    fn unlock(&mut self) {}
+    fn new_surface(&mut self, _: LockSurface, _: WlOutput) {}
+}
+
+delegate_session_lock!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
 #[cfg(feature = "xwayland")]
 impl<BackendData: Backend + 'static> XWaylandKeyboardGrabHandler for AnvilState<BackendData> {
