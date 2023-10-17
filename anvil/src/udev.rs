@@ -216,20 +216,27 @@ pub fn run_udev() {
      * Initialize the compositor
      */
     let primary_gpu = if let Ok(var) = std::env::var("ANVIL_DRM_DEVICE") {
+        panic!();
         DrmNode::from_path(var).expect("Invalid drm device path")
     } else {
+        eprintln!("FOO");
+        let x = dbg!(primary_gpu(&session.seat())).unwrap().unwrap();
+        dbg!(DrmNode::from_path(x).unwrap().node_with_type(NodeType::Render));
         primary_gpu(&session.seat())
             .unwrap()
             .and_then(|x| DrmNode::from_path(x).ok()?.node_with_type(NodeType::Render)?.ok())
-            .unwrap_or_else(|| {
-                all_gpus(session.seat())
-                    .unwrap()
-                    .into_iter()
-                    .find_map(|x| DrmNode::from_path(x).ok())
-                    .expect("No GPU!")
-            })
+            .unwrap()
+        /*
+        .unwrap_or_else(|| {
+            all_gpus(session.seat())
+                .unwrap()
+                .into_iter()
+                .find_map(|x| DrmNode::from_path(x).ok())
+                .expect("No GPU!")
+        })
+        */
     };
-    info!("Using {} as primary gpu.", primary_gpu);
+    info!("Using BAR {} as primary gpu.", primary_gpu);
 
     let gpus = GpuManager::new(GbmGlesBackend::with_context_priority(ContextPriority::High)).unwrap();
 
@@ -846,6 +853,11 @@ fn get_surface_dmabuf_feedback(
 
 impl AnvilState<UdevData> {
     fn device_added(&mut self, node: DrmNode, path: &Path) -> Result<(), DeviceAddError> {
+        dbg!("device_added", path);
+        // XXX
+        let node = node.node_with_type(NodeType::Render).unwrap().unwrap();
+        let path = format!("/dev/dri/{}", node);
+        let path = Path::new(&path);
         // Try to open the device
         let fd = self
             .backend_data

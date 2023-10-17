@@ -46,6 +46,7 @@ impl DrmNode {
 
     /// Creates a DRM node from path.
     pub fn from_path<A: AsRef<Path>>(path: A) -> Result<DrmNode, CreateDrmNodeError> {
+        dbg!("from_path", path.as_ref());
         let stat = stat(path.as_ref()).map_err(Into::<io::Error>::into)?;
         DrmNode::from_stat(stat)
     }
@@ -61,18 +62,24 @@ impl DrmNode {
         let major = major(dev);
         let minor = minor(dev);
 
+        dbg!("from_dev_id", dev, major, minor);
+
         if !is_device_drm(major, minor) {
             return Err(CreateDrmNodeError::NotDrmNode);
         }
 
         /*
-        The type of the DRM node is determined by the minor number ranges.
+        The type of the DRM node is determined by the node number ranges.
 
         0-63 -> Primary
         64-127 -> Control
         128-255 -> Render
         */
-        let ty = match minor >> 6 {
+        let Some(id) = node_id(major, minor) else {
+            return Err(CreateDrmNodeError::NotDrmNode);
+        };
+        dbg!(id);
+        let ty = match id >> 6 {
             0 => NodeType::Primary,
             1 => NodeType::Control,
             2 => NodeType::Render,
@@ -139,7 +146,10 @@ impl DrmNode {
 
 impl Display for DrmNode {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}{}", self.ty.minor_name_prefix(), minor(self.dev_id()))
+        let major = major(self.dev_id());
+        let minor = minor(self.dev_id());
+        let id = node_id(major, minor).unwrap(); // XXX
+        write!(f, "{}{}", self.ty.minor_name_prefix(), id)
     }
 }
 
@@ -332,25 +342,23 @@ fn dev_path(major: u64, minor: u64, ty: NodeType) -> io::Result<PathBuf> {
         ));
     }
 
-    if let Some(dev_name) = devname(major, minor) {
-        let suffix = dev_name.trim_start_matches(|c: char| !c.is_numeric());
-        if let Ok(old_id) = suffix.parse::<u32>() {
-            let old_ty = match old_id >> 6 {
-                0 => NodeType::Primary,
-                1 => NodeType::Control,
-                2 => NodeType::Render,
-                _ => {
-                    return Err(io::Error::new(
-                        ErrorKind::NotFound,
-                        format!("{}:{} is no DRM device", major, minor),
-                    ));
-                }
-            };
-            let id = old_id - get_minor_base(old_ty) + get_minor_base(ty);
-            let path = PathBuf::from(format!("/dev/dri/{}{}", ty.minor_name_prefix(), id));
-            if path.exists() {
-                return Ok(path);
+    if let Some(old_id) = node_id(major, minor) {
+        let old_ty = match old_id >> 6 {
+            0 => NodeType::Primary,
+            1 => NodeType::Control,
+            2 => NodeType::Render,
+            _ => {
+                return Err(io::Error::new(
+                    ErrorKind::NotFound,
+                    format!("{}:{} is no DRM device", major, minor),
+                ));
             }
+        };
+        let id = old_id - get_minor_base(old_ty) + get_minor_base(ty);
+        dbg!(old_id, get_minor_base(old_ty), get_minor_base(ty), id);
+        let path = PathBuf::from(format!("/dev/dri/{}{}", ty.minor_name_prefix(), id));
+        if path.exists() {
+            return Ok(path);
         }
     }
 
@@ -361,6 +369,18 @@ fn dev_path(major: u64, minor: u64, ty: NodeType) -> io::Result<PathBuf> {
             ty, major, minor
         ),
     ))
+}
+
+#[cfg(target_os = "linux")]
+fn node_id(_major: u64, minor: u64) -> Option<u32> {
+    Some(minor)
+}
+
+#[cfg(target_os = "freebsd")]
+fn node_id(major: u64, minor: u64) -> Option<u32> {
+    let dev_name = devname(major, minor)?;
+    let suffix = dev_name.trim_start_matches(|c: char| !c.is_numeric());
+    suffix.parse::<u32>().ok()
 }
 
 #[cfg(target_os = "freebsd")]
