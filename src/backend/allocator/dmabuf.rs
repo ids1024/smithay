@@ -23,100 +23,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::{error, fmt};
 
+pub use smithay_buffer::dmabuf::{Dmabuf, DmabufFlags, WeakDmabuf, Plane, PlaneRef, DmabufBuilder};
+
 /// Maximum amount of planes this implementation supports
 pub const MAX_PLANES: usize = 4;
-
-#[derive(Debug)]
-pub(crate) struct DmabufInternal {
-    /// The submitted planes
-    pub planes: Vec<Plane>,
-    /// The size of this buffer
-    pub size: Size<i32, BufferCoords>,
-    /// The format in use
-    pub format: Fourcc,
-    /// The flags applied to it
-    ///
-    /// This is a bitflag, to be compared with the `Flags` enum re-exported by this module.
-    pub flags: DmabufFlags,
-}
-
-#[derive(Debug)]
-pub(crate) struct Plane {
-    pub fd: OwnedFd,
-    /// The plane index
-    pub plane_idx: u32,
-    /// Offset from the start of the Fd
-    pub offset: u32,
-    /// Stride for this plane
-    pub stride: u32,
-    /// Modifier for this plane
-    pub modifier: Modifier,
-}
-
-impl From<Plane> for OwnedFd {
-    fn from(plane: Plane) -> OwnedFd {
-        plane.fd
-    }
-}
-
-bitflags::bitflags! {
-    /// Possible flags for a DMA buffer
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    pub struct DmabufFlags: u32 {
-        /// The buffer content is Y-inverted
-        const Y_INVERT = 1;
-        /// The buffer content is interlaced
-        const INTERLACED = 2;
-        /// The buffer content if interlaced is bottom-field first
-        const BOTTOM_FIRST = 4;
-    }
-}
-
-#[derive(Debug, Clone)]
-/// Strong reference to a dmabuf handle
-pub struct Dmabuf(pub(crate) Arc<DmabufInternal>);
-
-#[derive(Debug, Clone)]
-/// Weak reference to a dmabuf handle
-pub struct WeakDmabuf(pub(crate) Weak<DmabufInternal>);
-
-// A reference to a particular dmabuf plane fd, so it can be used as a calloop source.
-#[derive(Debug)]
-struct PlaneRef {
-    dmabuf: Dmabuf,
-    idx: usize,
-}
-
-impl AsFd for PlaneRef {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.dmabuf.0.planes[self.idx].fd.as_fd()
-    }
-}
-
-impl PartialEq for Dmabuf {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-impl Eq for Dmabuf {}
-
-impl PartialEq for WeakDmabuf {
-    fn eq(&self, other: &Self) -> bool {
-        Weak::ptr_eq(&self.0, &other.0)
-    }
-}
-impl Eq for WeakDmabuf {}
-
-impl Hash for Dmabuf {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.0).hash(state)
-    }
-}
-impl Hash for WeakDmabuf {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.as_ptr().hash(state)
-    }
-}
 
 impl Buffer for Dmabuf {
     fn size(&self) -> Size<i32, BufferCoords> {
@@ -131,45 +41,7 @@ impl Buffer for Dmabuf {
     }
 }
 
-/// Builder for Dmabufs
-#[derive(Debug)]
-pub struct DmabufBuilder {
-    internal: DmabufInternal,
-}
-
-impl DmabufBuilder {
-    /// Add a plane to the constructed Dmabuf
-    ///
-    /// *Note*: Each Dmabuf needs at least one plane.
-    /// MAX_PLANES notes the maximum amount of planes any format may use with this implementation.
-    pub fn add_plane(&mut self, fd: OwnedFd, idx: u32, offset: u32, stride: u32, modifier: Modifier) -> bool {
-        if self.internal.planes.len() == MAX_PLANES {
-            return false;
-        }
-        self.internal.planes.push(Plane {
-            fd,
-            plane_idx: idx,
-            offset,
-            stride,
-            modifier,
-        });
-
-        true
-    }
-
-    /// Build a `Dmabuf` out of the provided parameters and planes
-    ///
-    /// Returns `None` if the builder has no planes attached.
-    pub fn build(mut self) -> Option<Dmabuf> {
-        if self.internal.planes.is_empty() {
-            return None;
-        }
-
-        self.internal.planes.sort_by_key(|plane| plane.plane_idx);
-        Some(Dmabuf(Arc::new(self.internal)))
-    }
-}
-
+/*
 impl Dmabuf {
     /// Create a new Dmabuf by initializing with values from an existing buffer
     ///
@@ -266,6 +138,7 @@ impl WeakDmabuf {
         self.0.strong_count() == 0
     }
 }
+*/
 
 /// Buffer that can be exported as Dmabufs
 pub trait AsDmabuf {

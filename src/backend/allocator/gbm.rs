@@ -211,6 +211,7 @@ impl<T> AsDmabuf for GbmBuffer<T> {
     }
 }
 
+/*
 impl Dmabuf {
     /// Import a Dmabuf using libgbm, creating a gbm Buffer Object to the same underlying data.
     #[profiling::function]
@@ -260,3 +261,4 @@ impl Dmabuf {
         }
     }
 }
+*/
