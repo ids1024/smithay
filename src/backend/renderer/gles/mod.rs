@@ -1657,7 +1657,7 @@ impl Bind<Dmabuf> for GlesRenderer {
                         //TODO wrap image and drop here
                         return Err(GlesError::FramebufferBindingError);
                     }
-                    let shadow = self.create_shadow_buffer(dmabuf.0.size)?;
+                    let shadow = self.create_shadow_buffer(dmabuf.dmabuf_size().into())?;
 
                     let buf = GlesBuffer {
                         dmabuf: dmabuf.weak(),

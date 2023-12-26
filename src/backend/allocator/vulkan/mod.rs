@@ -436,7 +436,7 @@ impl AsDmabuf for VulkanImage {
             .memory(self.inner.memory);
 
         let fd = unsafe { self.khr_external_memory_fd.get_memory_fd(&create_info) }?;
-        let mut builder = Dmabuf::builder(self.size(), self.format().code, DmabufFlags::empty());
+        let mut builder = Dmabuf::builder(self.size().into(), self.format().code, DmabufFlags::empty());
 
         for idx in 0..self.format_plane_count {
             // get_image_subresource_layout only gets the layout of one memory plane. This mask specifies

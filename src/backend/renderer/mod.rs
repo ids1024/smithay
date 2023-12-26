@@ -748,7 +748,7 @@ pub fn buffer_has_alpha(buffer: &wl_buffer::WlBuffer) -> Option<bool> {
     use crate::wayland::shm::shm_format_to_fourcc;
 
     if let Ok(dmabuf) = crate::wayland::dmabuf::get_dmabuf(buffer) {
-        return Some(crate::backend::allocator::format::has_alpha(dmabuf.0.format));
+        return Some(crate::backend::allocator::format::has_alpha(dmabuf.drm_format()));
     }
 
     if let Ok(has_alpha) = crate::wayland::shm::with_buffer_contents(buffer, |_, _, data| {

@@ -18,9 +18,9 @@ use crate::utils::{Buffer as BufferCoords, Size};
 #[cfg(feature = "wayland_frontend")]
 use crate::wayland::compositor::{Blocker, BlockerState};
 use std::hash::{Hash, Hasher};
-use std::os::unix::io::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::io::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::{error, fmt};
 
 pub use smithay_buffer::dmabuf::{Dmabuf, DmabufFlags, WeakDmabuf, Plane, PlaneRef, DmabufBuilder};
@@ -30,13 +30,13 @@ pub const MAX_PLANES: usize = 4;
 
 impl Buffer for Dmabuf {
     fn size(&self) -> Size<i32, BufferCoords> {
-        self.0.size
+        self.dmabuf_size().into()
     }
 
     fn format(&self) -> Format {
         Format {
-            code: self.0.format,
-            modifier: self.0.planes[0].modifier,
+            code: self.drm_format(),
+            modifier: self.planes()[0].modifier,
         }
     }
 }
@@ -59,57 +59,6 @@ impl Dmabuf {
         }
     }
 
-    /// Create a new Dmabuf builder
-    pub fn builder(
-        size: impl Into<Size<i32, BufferCoords>>,
-        format: Fourcc,
-        flags: DmabufFlags,
-    ) -> DmabufBuilder {
-        DmabufBuilder {
-            internal: DmabufInternal {
-                planes: Vec::with_capacity(MAX_PLANES),
-                size: size.into(),
-                format,
-                flags,
-            },
-        }
-    }
-
-    /// The amount of planes this Dmabuf has
-    pub fn num_planes(&self) -> usize {
-        self.0.planes.len()
-    }
-
-    /// Returns raw handles of the planes of this buffer
-    pub fn handles(&self) -> impl Iterator<Item = BorrowedFd<'_>> + '_ {
-        self.0.planes.iter().map(|p| p.fd.as_fd())
-    }
-
-    /// Returns offsets for the planes of this buffer
-    pub fn offsets(&self) -> impl Iterator<Item = u32> + '_ {
-        self.0.planes.iter().map(|p| p.offset)
-    }
-
-    /// Returns strides for the planes of this buffer
-    pub fn strides(&self) -> impl Iterator<Item = u32> + '_ {
-        self.0.planes.iter().map(|p| p.stride)
-    }
-
-    /// Returns if this buffer format has any vendor-specific modifiers set or is implicit/linear
-    pub fn has_modifier(&self) -> bool {
-        self.0.planes[0].modifier != Modifier::Invalid && self.0.planes[0].modifier != Modifier::Linear
-    }
-
-    /// Returns if the buffer is stored inverted on the y-axis
-    pub fn y_inverted(&self) -> bool {
-        self.0.flags.contains(DmabufFlags::Y_INVERT)
-    }
-
-    /// Create a weak reference to this dmabuf
-    pub fn weak(&self) -> WeakDmabuf {
-        WeakDmabuf(Arc::downgrade(&self.0))
-    }
-
     /// Create an [`calloop::EventSource`] and [`crate::wayland::compositor::Blocker`] for this [`Dmabuf`].
     ///
     /// Usually used to block applying surface state on the readiness of an attached dmabuf.
@@ -122,20 +71,6 @@ impl Dmabuf {
         let source = DmabufSource::new(self.clone(), interest)?;
         let blocker = DmabufBlocker(source.signal.clone());
         Ok((blocker, source))
-    }
-}
-
-impl WeakDmabuf {
-    /// Try to upgrade to a strong reference of this buffer.
-    ///
-    /// Fails if no strong references exist anymore and the handle was already closed.
-    pub fn upgrade(&self) -> Option<Dmabuf> {
-        self.0.upgrade().map(Dmabuf)
-    }
-
-    /// Returns true if there are not any strong references remaining
-    pub fn is_gone(&self) -> bool {
-        self.0.strong_count() == 0
     }
 }
 */

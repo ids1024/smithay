@@ -609,7 +609,7 @@ impl EGLDisplay {
         }
 
         let mut dma = Dmabuf::builder(
-            size,
+            size.into(),
             Fourcc::try_from(format as u32).expect("Unknown format"),
             if y_inverted {
                 DmabufFlags::Y_INVERT

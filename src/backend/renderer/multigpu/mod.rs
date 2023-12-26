@@ -1669,7 +1669,7 @@ where
         damage: &[Rectangle<i32, BufferCoords>],
     ) -> Result<<Self as Renderer>::TextureId, <Self as Renderer>::Error> {
         let dmabuf = get_dmabuf(buffer).expect("import_dma_buffer without checking buffer type?");
-        let texture = MultiTexture::from_surface(surface, dmabuf.size());
+        let texture = MultiTexture::from_surface(surface, dmabuf.size().into());
         let texture_ref = texture.0.clone();
         let res = self.import_dmabuf_internal(None, &dmabuf, texture, Some(damage));
         if res.is_ok() {
@@ -1711,7 +1711,7 @@ where
         dmabuf: &Dmabuf,
         damage: Option<&[Rectangle<i32, BufferCoords>]>,
     ) -> Result<<Self as Renderer>::TextureId, <Self as Renderer>::Error> {
-        let texture = MultiTexture::new(dmabuf.size());
+        let texture = MultiTexture::new(dmabuf.size().into());
         self.import_dmabuf_internal(None, dmabuf, texture, damage)
     }
 }

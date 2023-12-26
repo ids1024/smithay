@@ -97,7 +97,7 @@ impl AsDmabuf for DumbBuffer {
     #[profiling::function]
     fn export(&self) -> Result<Dmabuf, Self::Error> {
         let fd = self.fd.buffer_to_prime_fd(self.handle.handle(), 0)?;
-        let mut builder = Dmabuf::builder(self.size(), self.format.code, DmabufFlags::empty());
+        let mut builder = Dmabuf::builder(self.size().into(), self.format.code, DmabufFlags::empty());
         builder.add_plane(fd, 0, 0, self.handle.pitch(), Modifier::Linear);
         builder.build().ok_or(rustix::io::Errno::INVAL.into())
     }
