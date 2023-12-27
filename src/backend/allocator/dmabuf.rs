@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::{error, fmt};
 
-pub use smithay_buffer::dmabuf::{Dmabuf, DmabufFlags, WeakDmabuf, Plane, PlaneRef, DmabufBuilder};
+pub use smithay_buffer::dmabuf::{Dmabuf, DmabufBuilder, DmabufFlags, Plane, PlaneRef, WeakDmabuf};
 
 /// Maximum amount of planes this implementation supports
 pub const MAX_PLANES: usize = 4;

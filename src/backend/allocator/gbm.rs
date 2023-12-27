@@ -153,7 +153,12 @@ impl<T> AsDmabuf for GbmBuffer<T> {
     fn export(&self) -> Result<Dmabuf, GbmConvertError> {
         let planes = self.plane_count()? as i32;
 
-        let mut builder = Dmabuf::builder_from_buffer(self, DmabufFlags::empty());
+        // TODO
+        let mut builder = Dmabuf::builder(
+            self.size().into(),
+            Buffer::format(self).code,
+            DmabufFlags::empty(),
+        );
         for idx in 0..planes {
             let fd = self.fd_for_plane(idx)?;
 
@@ -211,11 +216,19 @@ impl<T> AsDmabuf for GbmBuffer<T> {
     }
 }
 
-/*
-impl Dmabuf {
+// TODO
+pub trait DmabufExt {
+    fn import_to<A: AsFd + 'static, T>(
+        &self,
+        gbm: &GbmDevice<A>,
+        usage: GbmBufferFlags,
+    ) -> std::io::Result<GbmBuffer<T>>;
+}
+
+impl DmabufExt for Dmabuf {
     /// Import a Dmabuf using libgbm, creating a gbm Buffer Object to the same underlying data.
     #[profiling::function]
-    pub fn import_to<A: AsFd + 'static, T>(
+    fn import_to<A: AsFd + 'static, T>(
         &self,
         gbm: &GbmDevice<A>,
         usage: GbmBufferFlags,
@@ -261,4 +274,3 @@ impl Dmabuf {
         }
     }
 }
-*/

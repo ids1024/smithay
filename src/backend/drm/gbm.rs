@@ -141,6 +141,7 @@ pub fn framebuffer_from_dmabuf<A: AsFd + 'static>(
     dmabuf: &Dmabuf,
     use_opaque: bool,
 ) -> Result<GbmFramebuffer, Error> {
+    use crate::backend::allocator::gbm::DmabufExt; // TODO
     let bo: BufferObject<()> = dmabuf
         .import_to(gbm, gbm::BufferObjectFlags::SCANOUT)
         .map_err(Error::Import)?;
