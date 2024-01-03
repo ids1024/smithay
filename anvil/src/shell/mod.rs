@@ -121,7 +121,8 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
                     })
             });
             if let Some(dmabuf) = maybe_dmabuf {
-                if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
+                //if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
+                if let Ok((blocker, source)) = smithay::backend::allocator::dmabuf::generate_blocker(&dmabuf, Interest::READ) {
                     let client = surface.client().unwrap();
                     let res = state.handle.insert_source(source, move |_, _, data| {
                         data.state

@@ -75,6 +75,21 @@ impl Dmabuf {
 }
 */
 
+// XXX
+/// Create an [`calloop::EventSource`] and [`crate::wayland::compositor::Blocker`] for this [`Dmabuf`].
+///
+/// Usually used to block applying surface state on the readiness of an attached dmabuf.
+#[cfg(feature = "wayland_frontend")]
+#[profiling::function]
+pub fn generate_blocker(
+    dmabuf: &Dmabuf,
+    interest: Interest,
+) -> Result<(DmabufBlocker, DmabufSource), AlreadyReady> {
+    let source = DmabufSource::new(dmabuf.clone(), interest)?;
+    let blocker = DmabufBlocker(source.signal.clone());
+    Ok((blocker, source))
+}
+
 /// Buffer that can be exported as Dmabufs
 pub trait AsDmabuf {
     /// Error type returned, if exporting fails
