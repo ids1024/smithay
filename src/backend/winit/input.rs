@@ -1,18 +1,16 @@
-use std::{cell::RefCell, path::PathBuf, rc::Rc};
+use std::path::PathBuf;
 
 use winit::{
-    dpi::LogicalPosition,
+    dpi::PhysicalPosition,
     event::{ElementState, MouseButton as WinitMouseButton, MouseScrollDelta},
 };
 
 use crate::backend::input::{
-    self, AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, Event,
-    InputBackend, KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+    self, AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState, Device,
+    DeviceCapability, Event, InputBackend, KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
     PointerMotionAbsoluteEvent, TouchCancelEvent, TouchDownEvent, TouchEvent, TouchMotionEvent, TouchSlot,
     TouchUpEvent, UnusedEvent,
 };
-
-use super::WindowSize;
 
 /// Marker used to define the `InputBackend` types for the winit backend.
 #[derive(Debug)]
@@ -83,9 +81,9 @@ impl KeyboardKeyEvent<WinitInput> for WinitKeyboardInputEvent {
 /// Winit-Backend internal event wrapping `winit`'s types into a [`PointerMotionAbsoluteEvent`]
 #[derive(Debug, Clone)]
 pub struct WinitMouseMovedEvent {
-    pub(crate) size: Rc<RefCell<WindowSize>>,
     pub(crate) time: u64,
-    pub(crate) logical_position: LogicalPosition<f64>,
+    pub(crate) position: RelativePosition,
+    pub(crate) global_position: PhysicalPosition<f64>,
 }
 
 impl Event<WinitInput> for WinitMouseMovedEvent {
@@ -100,27 +98,20 @@ impl Event<WinitInput> for WinitMouseMovedEvent {
 
 impl PointerMotionAbsoluteEvent<WinitInput> for WinitMouseMovedEvent {}
 impl AbsolutePositionEvent<WinitInput> for WinitMouseMovedEvent {
-    // TODO: maybe use {Logical, Physical}Position from winit?
     fn x(&self) -> f64 {
-        let wsize = self.size.borrow();
-        self.logical_position.x * wsize.scale_factor
+        self.global_position.x
     }
 
     fn y(&self) -> f64 {
-        let wsize = self.size.borrow();
-        self.logical_position.y * wsize.scale_factor
+        self.global_position.y
     }
 
     fn x_transformed(&self, width: i32) -> f64 {
-        let wsize = self.size.borrow();
-        let w_width = wsize.logical_size().w;
-        f64::max(self.logical_position.x * width as f64 / w_width, 0.0)
+        f64::max(self.position.x * width as f64, 0.0)
     }
 
     fn y_transformed(&self, height: i32) -> f64 {
-        let wsize = self.size.borrow();
-        let w_height = wsize.logical_size().h;
-        f64::max(self.logical_position.y * height as f64 / w_height, 0.0)
+        f64::max(self.position.y * height as f64, 0.0)
     }
 }
 
@@ -157,12 +148,18 @@ impl PointerAxisEvent<WinitInput> for WinitMouseWheelEvent {
         }
     }
 
-    fn amount_discrete(&self, axis: Axis) -> Option<f64> {
+    // TODO: Use high-res scroll where backend supports it
+    fn amount_v120(&self, axis: Axis) -> Option<f64> {
         match (axis, self.delta) {
-            (Axis::Horizontal, MouseScrollDelta::LineDelta(x, _)) => Some(x as f64),
-            (Axis::Vertical, MouseScrollDelta::LineDelta(_, y)) => Some(y as f64),
+            (Axis::Horizontal, MouseScrollDelta::LineDelta(x, _)) => Some(x as f64 * 120.),
+            (Axis::Vertical, MouseScrollDelta::LineDelta(_, y)) => Some(y as f64 * 120.),
             (_, MouseScrollDelta::PixelDelta(_)) => None,
         }
+    }
+
+    // TODO: Implement with Wayland if `wl_pointer` version >= 9
+    fn relative_direction(&self, _axis: Axis) -> AxisRelativeDirection {
+        AxisRelativeDirection::Identical
     }
 }
 
@@ -191,6 +188,8 @@ impl PointerButtonEvent<WinitInput> for WinitMouseInputEvent {
             WinitMouseButton::Left => 0x110,
             WinitMouseButton::Right => 0x111,
             WinitMouseButton::Middle => 0x112,
+            WinitMouseButton::Forward => 0x115,
+            WinitMouseButton::Back => 0x116,
             WinitMouseButton::Other(b) => {
                 if self.is_x11 {
                     input::xorg_mouse_to_libinput(b as u32)
@@ -209,9 +208,9 @@ impl PointerButtonEvent<WinitInput> for WinitMouseInputEvent {
 /// Winit-Backend internal event wrapping `winit`'s types into a [`TouchDownEvent`]
 #[derive(Debug, Clone)]
 pub struct WinitTouchStartedEvent {
-    pub(crate) size: Rc<RefCell<WindowSize>>,
     pub(crate) time: u64,
-    pub(crate) location: LogicalPosition<f64>,
+    pub(crate) position: RelativePosition,
+    pub(crate) global_position: PhysicalPosition<f64>,
     pub(crate) id: u64,
 }
 
@@ -235,34 +234,28 @@ impl TouchEvent<WinitInput> for WinitTouchStartedEvent {
 
 impl AbsolutePositionEvent<WinitInput> for WinitTouchStartedEvent {
     fn x(&self) -> f64 {
-        let wsize = self.size.borrow();
-        self.location.x * wsize.scale_factor
+        self.global_position.x
     }
 
     fn y(&self) -> f64 {
-        let wsize = self.size.borrow();
-        self.location.y * wsize.scale_factor
+        self.global_position.y
     }
 
     fn x_transformed(&self, width: i32) -> f64 {
-        let wsize = self.size.borrow();
-        let w_width = wsize.logical_size().w;
-        f64::max(self.location.x * width as f64 / w_width, 0.0)
+        f64::max(self.position.x * width as f64, 0.0)
     }
 
     fn y_transformed(&self, height: i32) -> f64 {
-        let wsize = self.size.borrow();
-        let w_height = wsize.logical_size().h;
-        f64::max(self.location.y * height as f64 / w_height, 0.0)
+        f64::max(self.position.y * height as f64, 0.0)
     }
 }
 
 /// Winit-Backend internal event wrapping `winit`'s types into a [`TouchMotionEvent`]
 #[derive(Debug, Clone)]
 pub struct WinitTouchMovedEvent {
-    pub(crate) size: Rc<RefCell<WindowSize>>,
     pub(crate) time: u64,
-    pub(crate) location: LogicalPosition<f64>,
+    pub(crate) position: RelativePosition,
+    pub(crate) global_position: PhysicalPosition<f64>,
     pub(crate) id: u64,
 }
 
@@ -286,25 +279,19 @@ impl TouchEvent<WinitInput> for WinitTouchMovedEvent {
 
 impl AbsolutePositionEvent<WinitInput> for WinitTouchMovedEvent {
     fn x(&self) -> f64 {
-        let wsize = self.size.borrow();
-        self.location.x * wsize.scale_factor
+        self.global_position.x
     }
 
     fn y(&self) -> f64 {
-        let wsize = self.size.borrow();
-        self.location.y * wsize.scale_factor
+        self.global_position.y
     }
 
     fn x_transformed(&self, width: i32) -> f64 {
-        let wsize = self.size.borrow();
-        let w_width = wsize.logical_size().w;
-        f64::max(self.location.x * width as f64 / w_width, 0.0)
+        f64::max(self.position.x * width as f64, 0.0)
     }
 
     fn y_transformed(&self, height: i32) -> f64 {
-        let wsize = self.size.borrow();
-        let w_height = wsize.logical_size().h;
-        f64::max(self.location.y * height as f64 / w_height, 0.0)
+        f64::max(self.position.y * height as f64, 0.0)
     }
 }
 
@@ -376,6 +363,22 @@ impl From<ElementState> for ButtonState {
     }
 }
 
+/// Position relative to the source window, so each coordinate lays inside
+/// the range from [0;1].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RelativePosition {
+    /// Position of the `x` relative to the window.
+    x: f64,
+    /// Position of the `y` relative to the window.
+    y: f64,
+}
+
+impl RelativePosition {
+    pub(crate) fn new(x: f64, y: f64) -> Self {
+        Self { x, y }
+    }
+}
+
 impl InputBackend for WinitInput {
     type Device = WinitVirtualDevice;
     type KeyboardKeyEvent = WinitKeyboardInputEvent;
@@ -402,6 +405,8 @@ impl InputBackend for WinitInput {
     type TabletToolProximityEvent = UnusedEvent;
     type TabletToolTipEvent = UnusedEvent;
     type TabletToolButtonEvent = UnusedEvent;
+
+    type SwitchToggleEvent = UnusedEvent;
 
     type SpecialEvent = UnusedEvent;
 }

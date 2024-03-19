@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    os::unix::io::OwnedFd,
+    os::unix::io::{AsFd, OwnedFd},
     sync::{Arc, Mutex},
 };
 
@@ -9,56 +9,64 @@ use wayland_server::{
     protocol::{
         wl_data_device_manager::DndAction,
         wl_data_offer::{self, WlDataOffer},
-        wl_seat::WlSeat,
+        wl_data_source::{self, WlDataSource},
         wl_surface::WlSurface,
     },
     DisplayHandle, Resource,
 };
 
-use crate::input::{
-    pointer::{
-        AxisFrame, ButtonEvent, GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent,
-        GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
-        GestureSwipeUpdateEvent, GrabStartData as PointerGrabStartData, MotionEvent, PointerGrab,
-        PointerInnerHandle, RelativeMotionEvent,
+use crate::{
+    input::{
+        pointer::{
+            AxisFrame, ButtonEvent, GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent,
+            GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
+            GestureSwipeUpdateEvent, GrabStartData as PointerGrabStartData, MotionEvent, PointerGrab,
+            PointerInnerHandle, RelativeMotionEvent,
+        },
+        Seat, SeatHandler,
     },
-    Seat, SeatHandler,
+    utils::{IsAlive, Logical, Point},
+    wayland::{seat::WaylandFocus, selection::seat_data::SeatData},
 };
-use crate::utils::{Logical, Point};
-use crate::wayland::seat::WaylandFocus;
 
-use super::{DataDeviceHandler, DataDeviceUserData, SeatData, ServerDndGrabHandler, SourceMetadata};
+use super::{with_source_metadata, ClientDndGrabHandler, DataDeviceHandler};
 
-pub(crate) struct ServerDnDGrab<D: SeatHandler> {
+pub(crate) struct DnDGrab<D: SeatHandler> {
     dh: DisplayHandle,
     start_data: PointerGrabStartData<D>,
-    metadata: super::SourceMetadata,
+    data_source: Option<wl_data_source::WlDataSource>,
     current_focus: Option<WlSurface>,
     pending_offers: Vec<wl_data_offer::WlDataOffer>,
-    offer_data: Option<Arc<Mutex<ServerDndOfferData>>>,
+    offer_data: Option<Arc<Mutex<OfferData>>>,
+    icon: Option<WlSurface>,
+    origin: WlSurface,
     seat: Seat<D>,
 }
 
-impl<D: SeatHandler> ServerDnDGrab<D> {
+impl<D: SeatHandler> DnDGrab<D> {
     pub(crate) fn new(
         dh: &DisplayHandle,
         start_data: PointerGrabStartData<D>,
-        metadata: super::SourceMetadata,
+        source: Option<wl_data_source::WlDataSource>,
+        origin: WlSurface,
         seat: Seat<D>,
+        icon: Option<WlSurface>,
     ) -> Self {
         Self {
             dh: dh.clone(),
             start_data,
-            metadata,
+            data_source: source,
             current_focus: None,
             pending_offers: Vec::with_capacity(1),
             offer_data: None,
+            origin,
+            icon,
             seat,
         }
     }
 }
 
-impl<D> PointerGrab<D> for ServerDnDGrab<D>
+impl<D> PointerGrab<D> for DnDGrab<D>
 where
     D: DataDeviceHandler,
     D: SeatHandler,
@@ -72,10 +80,6 @@ where
         focus: Option<(<D as SeatHandler>::PointerFocus, Point<i32, Logical>)>,
         event: &MotionEvent,
     ) {
-        let location = event.location;
-        let serial = event.serial;
-        let time = event.time;
-
         // While the grab is active, no client has pointer focus
         handle.motion(data, None, event);
 
@@ -88,15 +92,18 @@ where
         if focus.as_ref().and_then(|(s, _)| s.wl_surface()) != self.current_focus.clone() {
             // focus changed, we need to make a leave if appropriate
             if let Some(surface) = self.current_focus.take() {
-                for device in seat_data.known_devices() {
-                    if device.id().same_client_as(&surface.id()) {
-                        device.leave();
+                // only leave if there is a data source or we are on the original client
+                if self.data_source.is_some() || self.origin.id().same_client_as(&surface.id()) {
+                    for device in seat_data.known_data_devices() {
+                        if device.id().same_client_as(&surface.id()) {
+                            device.leave();
+                        }
                     }
-                }
-                // disable the offers
-                self.pending_offers.clear();
-                if let Some(offer_data) = self.offer_data.take() {
-                    offer_data.lock().unwrap().active = false;
+                    // disable the offers
+                    self.pending_offers.clear();
+                    if let Some(offer_data) = self.offer_data.take() {
+                        offer_data.lock().unwrap().active = false;
+                    }
                 }
             }
         }
@@ -107,58 +114,69 @@ where
             // early return if the surface is no longer valid
             let client = match self.dh.get_client(surface.id()) {
                 Ok(c) => c,
-                _ => return,
+                Err(_) => return,
             };
-            let (x, y) = (location - surface_location.to_f64()).into();
+            let (x, y) = (event.location - surface_location.to_f64()).into();
             if self.current_focus.is_none() {
-                // We entered a new surface, send the data offer
-                let offer_data = Arc::new(Mutex::new(ServerDndOfferData {
-                    active: true,
-                    dropped: false,
-                    accepted: true,
-                    chosen_action: DndAction::empty(),
-                }));
-                for device in seat_data
-                    .known_devices()
-                    .iter()
-                    .filter(|d| d.id().same_client_as(&surface.id()))
-                {
-                    let handle = self.dh.backend_handle();
-                    let wl_seat = match device.data::<DataDeviceUserData>() {
-                        Some(data) => data.wl_seat.clone(),
-                        None => continue,
-                    };
-                    // create a data offer
-                    let offer = handle
-                        .create_object::<D>(
-                            client.id(),
-                            WlDataOffer::interface(),
-                            device.version(),
-                            Arc::new(ServerDndData {
-                                metadata: self.metadata.clone(),
-                                ofer_data: offer_data.clone(),
-                                wl_seat,
-                            }),
-                        )
-                        .unwrap();
-                    let offer = WlDataOffer::from_id(&self.dh, offer).unwrap();
+                // We entered a new surface, send the data offer if appropriate
+                if let Some(ref source) = self.data_source {
+                    let offer_data = Arc::new(Mutex::new(OfferData {
+                        active: true,
+                        dropped: false,
+                        accepted: true,
+                        chosen_action: DndAction::empty(),
+                    }));
+                    for device in seat_data
+                        .known_data_devices()
+                        .filter(|d| d.id().same_client_as(&surface.id()))
+                    {
+                        let handle = self.dh.backend_handle();
 
-                    // advertize the offer to the client
-                    device.data_offer(&offer);
-                    for mime_type in self.metadata.mime_types.iter().cloned() {
-                        offer.offer(mime_type);
+                        // create a data offer
+                        let offer = handle
+                            .create_object::<D>(
+                                client.id(),
+                                WlDataOffer::interface(),
+                                device.version(),
+                                Arc::new(DndDataOffer {
+                                    offer_data: offer_data.clone(),
+                                    source: source.clone(),
+                                }),
+                            )
+                            .unwrap();
+                        let offer = WlDataOffer::from_id(&self.dh, offer).unwrap();
+
+                        // advertize the offer to the client
+                        device.data_offer(&offer);
+                        with_source_metadata(source, |meta| {
+                            for mime_type in meta.mime_types.iter().cloned() {
+                                offer.offer(mime_type);
+                            }
+                            offer.source_actions(meta.dnd_action);
+                        })
+                        .unwrap();
+                        device.enter(event.serial.into(), &surface, x, y, Some(&offer));
+                        self.pending_offers.push(offer);
                     }
-                    offer.source_actions(self.metadata.dnd_action);
-                    device.enter(serial.into(), &surface, x, y, Some(&offer));
-                    self.pending_offers.push(offer);
+                    self.offer_data = Some(offer_data);
+                } else {
+                    // only send if we are on a surface of the same client
+                    if self.origin.id().same_client_as(&surface.id()) {
+                        for device in seat_data.known_data_devices() {
+                            if device.id().same_client_as(&surface.id()) {
+                                device.enter(event.serial.into(), &surface, x, y, None);
+                            }
+                        }
+                    }
                 }
-                self.offer_data = Some(offer_data);
                 self.current_focus = Some(surface);
             } else {
                 // make a move
-                for device in seat_data.known_devices() {
-                    if device.id().same_client_as(&surface.id()) {
-                        device.motion(time, x, y);
+                if self.data_source.is_some() || self.origin.id().same_client_as(&surface.id()) {
+                    for device in seat_data.known_data_devices() {
+                        if device.id().same_client_as(&surface.id()) {
+                            device.motion(event.time, x, y);
+                        }
                     }
                 }
             }
@@ -176,9 +194,6 @@ where
     }
 
     fn button(&mut self, data: &mut D, handle: &mut PointerInnerHandle<'_, D>, event: &ButtonEvent) {
-        let serial = event.serial;
-        let time = event.time;
-
         if handle.current_pressed().is_empty() {
             // the user dropped, proceed to the drop
             let seat_data = self
@@ -194,9 +209,11 @@ where
                 false
             };
             if let Some(ref surface) = self.current_focus {
-                for device in seat_data.known_devices() {
-                    if device.id().same_client_as(&surface.id()) && validated {
-                        device.drop();
+                if self.data_source.is_some() || self.origin.id().same_client_as(&surface.id()) {
+                    for device in seat_data.known_data_devices() {
+                        if device.id().same_client_as(&surface.id()) && validated {
+                            device.drop();
+                        }
                     }
                 }
             }
@@ -208,27 +225,37 @@ where
                     data.active = false;
                 }
             }
-
-            ServerDndGrabHandler::dropped(data, self.seat.clone());
-            if !validated {
-                data.cancelled(self.seat.clone());
+            if let Some(ref source) = self.data_source {
+                if source.version() >= 3 {
+                    source.dnd_drop_performed();
+                }
+                if !validated {
+                    source.cancelled();
+                }
             }
+
+            ClientDndGrabHandler::dropped(data, self.seat.clone());
+            self.icon = None;
             // in all cases abandon the drop
             // no more buttons are pressed, release the grab
             if let Some(ref surface) = self.current_focus {
-                for device in seat_data.known_devices() {
+                for device in seat_data.known_data_devices() {
                     if device.id().same_client_as(&surface.id()) {
                         device.leave();
                     }
                 }
             }
-            handle.unset_grab(data, serial, time);
+            handle.unset_grab(data, event.serial, event.time, true);
         }
     }
 
     fn axis(&mut self, data: &mut D, handle: &mut PointerInnerHandle<'_, D>, details: AxisFrame) {
         // we just forward the axis events as is
         handle.axis(data, details);
+    }
+
+    fn frame(&mut self, data: &mut D, handle: &mut PointerInnerHandle<'_, D>) {
+        handle.frame(data);
     }
 
     fn gesture_swipe_begin(
@@ -309,22 +336,23 @@ where
 }
 
 #[derive(Debug)]
-struct ServerDndOfferData {
+struct OfferData {
     active: bool,
     dropped: bool,
     accepted: bool,
     chosen_action: DndAction,
 }
 
-struct ServerDndData {
-    metadata: SourceMetadata,
-    ofer_data: Arc<Mutex<ServerDndOfferData>>,
-    wl_seat: WlSeat,
+#[derive(Debug)]
+struct DndDataOffer {
+    offer_data: Arc<Mutex<OfferData>>,
+    source: WlDataSource,
 }
 
-impl<D> ObjectData<D> for ServerDndData
+impl<D> ObjectData<D> for DndDataOffer
 where
-    D: DataDeviceHandler + SeatHandler + 'static,
+    D: DataDeviceHandler,
+    D: 'static,
 {
     fn request(
         self: Arc<Self>,
@@ -335,58 +363,57 @@ where
     ) -> Option<Arc<dyn ObjectData<D>>> {
         let dh = DisplayHandle::from(dh.clone());
         if let Ok((resource, request)) = WlDataOffer::parse_request(&dh, msg) {
-            handle_server_dnd(handler, &resource, request, &self);
+            handle_dnd(handler, &resource, request, &self);
         }
 
         None
     }
 
-    fn destroyed(&self, _data: &mut D, _client_id: ClientId, _object_id: ObjectId) {}
+    fn destroyed(
+        self: Arc<Self>,
+        _handle: &Handle,
+        _data: &mut D,
+        _client_id: ClientId,
+        _object_id: ObjectId,
+    ) {
+    }
 }
 
-fn handle_server_dnd<D>(
-    handler: &mut D,
-    offer: &WlDataOffer,
-    request: wl_data_offer::Request,
-    data: &ServerDndData,
-) where
-    D: DataDeviceHandler + SeatHandler + 'static,
+fn handle_dnd<D>(handler: &mut D, offer: &WlDataOffer, request: wl_data_offer::Request, data: &DndDataOffer)
+where
+    D: DataDeviceHandler,
+    D: 'static,
 {
     use self::wl_data_offer::Request;
-
-    let metadata = &data.metadata;
-    let offer_data = &data.ofer_data;
-    let wl_seat = &data.wl_seat;
-
-    if !wl_seat.is_alive() {
-        return;
-    }
-    let seat = match Seat::<D>::from_resource(wl_seat) {
-        Some(s) => s,
-        None => return,
-    };
-
-    let mut data = offer_data.lock().unwrap();
+    let source = &data.source;
+    let mut data = data.offer_data.lock().unwrap();
     match request {
         Request::Accept { mime_type, .. } => {
-            if let Some(mtype) = &mime_type {
-                data.accepted = metadata.mime_types.contains(mtype);
+            if let Some(mtype) = mime_type {
+                if let Err(crate::utils::UnmanagedResource) = with_source_metadata(source, |meta| {
+                    data.accepted = meta.mime_types.contains(&mtype);
+                }) {
+                    data.accepted = false;
+                }
             } else {
                 data.accepted = false;
             }
-            handler.accept(mime_type, seat)
         }
         Request::Receive { mime_type, fd } => {
             // check if the source and associated mime type is still valid
-            if metadata.mime_types.contains(&mime_type) && data.active {
-                handler.send(mime_type, fd, seat);
+            let valid = with_source_metadata(source, |meta| meta.mime_types.contains(&mime_type))
+                .unwrap_or(false)
+                && source.alive()
+                && data.active;
+            if valid {
+                source.send(mime_type, fd.as_fd());
             }
         }
         Request::Destroy => {}
         Request::Finish => {
             if !data.active {
                 offer.post_error(
-                    wl_data_offer::Error::InvalidFinish as u32,
+                    wl_data_offer::Error::InvalidFinish,
                     "Cannot finish a data offer that is no longer active.",
                 );
                 return;
@@ -412,8 +439,7 @@ fn handle_server_dnd<D>(
                 );
                 return;
             }
-
-            handler.finished(seat);
+            source.dnd_finished();
             data.active = false;
         }
         Request::SetActions {
@@ -430,7 +456,10 @@ fn handle_server_dnd<D>(
                 offer.post_error(wl_data_offer::Error::InvalidAction, "Invalid preferred action.");
                 return;
             }
-            let possible_actions = metadata.dnd_action & dnd_actions;
+
+            let source_actions =
+                with_source_metadata(source, |meta| meta.dnd_action).unwrap_or_else(|_| DndAction::empty());
+            let possible_actions = source_actions & dnd_actions;
             let chosen_action = handler.action_choice(possible_actions, preferred_action);
             // check that the user provided callback respects that one precise action should be chosen
             debug_assert!(
@@ -440,7 +469,7 @@ fn handle_server_dnd<D>(
             if chosen_action != data.chosen_action {
                 data.chosen_action = chosen_action;
                 offer.action(chosen_action);
-                handler.action(chosen_action, seat);
+                source.action(chosen_action);
             }
         }
         _ => unreachable!(),

@@ -35,6 +35,8 @@ use bitflags::bitflags;
 use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
 use tracing::instrument;
 
+#[cfg(feature = "backend_drm")]
+use crate::backend::drm::DrmNode;
 use crate::{
     backend::{
         allocator::dmabuf::DmabufFlags,
@@ -132,6 +134,8 @@ pub struct VulkanAllocator {
     dropped_recv: mpsc::Receiver<ImageInner>,
     dropped_sender: mpsc::Sender<ImageInner>,
     phd: PhysicalDevice,
+    #[cfg(feature = "backend_drm")]
+    node: Option<DrmNode>,
     device: Arc<ash::Device>,
 }
 
@@ -248,6 +252,13 @@ impl VulkanAllocator {
 
         let (dropped_sender, dropped_recv) = mpsc::channel();
 
+        #[cfg(feature = "backend_drm")]
+        let node = phd
+            .render_node()
+            .ok()
+            .flatten()
+            .or_else(|| phd.primary_node().ok().flatten());
+
         let mut allocator = VulkanAllocator {
             formats: Vec::new(),
             images: Vec::new(),
@@ -257,6 +268,8 @@ impl VulkanAllocator {
             dropped_recv,
             dropped_sender,
             phd: phd.clone(),
+            #[cfg(feature = "backend_drm")]
+            node,
             device: Arc::new(device),
         };
 
@@ -377,6 +390,8 @@ pub struct VulkanImage {
     width: u32,
     height: u32,
     format: DrmFormat,
+    #[cfg(feature = "backend_drm")]
+    node: Option<DrmNode>,
     /// The number of planes the image has for dmabuf export.
     format_plane_count: u32,
     khr_external_memory_fd: khr::ExternalMemoryFd,
@@ -436,7 +451,12 @@ impl AsDmabuf for VulkanImage {
             .memory(self.inner.memory);
 
         let fd = unsafe { self.khr_external_memory_fd.get_memory_fd(&create_info) }?;
-        let mut builder = Dmabuf::builder(self.size(), self.format().code, DmabufFlags::empty());
+        let mut builder = Dmabuf::builder(
+            self.size(),
+            self.format().code,
+            self.format().modifier,
+            DmabufFlags::empty(),
+        );
 
         for idx in 0..self.format_plane_count {
             // get_image_subresource_layout only gets the layout of one memory plane. This mask specifies
@@ -458,8 +478,12 @@ impl AsDmabuf for VulkanImage {
                 idx,
                 layout.offset as u32,
                 layout.row_pitch as u32,
-                self.format().modifier,
             );
+        }
+
+        #[cfg(feature = "backend_drm")]
+        if let Some(node) = self.node {
+            builder.set_node(node);
         }
 
         Ok(builder.build().unwrap())
@@ -757,6 +781,8 @@ impl VulkanAllocator {
             khr_external_memory_fd: self.extension_fns.khr_external_memory_fd.clone(),
             dropped_sender: self.dropped_sender.clone(),
             device: Arc::downgrade(&self.device),
+            #[cfg(feature = "backend_drm")]
+            node: self.node,
         })
     }
 

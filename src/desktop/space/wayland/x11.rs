@@ -1,6 +1,5 @@
 use wayland_server::protocol::wl_surface::WlSurface;
 
-use super::*;
 use crate::{
     backend::renderer::{
         element::{
@@ -14,6 +13,8 @@ use crate::{
     wayland::seat::WaylandFocus,
     xwayland::X11Surface,
 };
+
+use super::{output_update, WindowOutputUserData};
 
 impl WaylandFocus for X11Surface {
     fn wl_surface(&self) -> Option<WlSurface> {
@@ -59,20 +60,11 @@ impl SpaceElement for X11Surface {
             state.borrow_mut().output_overlap.retain(|weak, _| weak != output);
         }
 
-        let mut surface_list = output_surfaces(output);
         let state = self.state.lock().unwrap();
         let Some(surface) = state.wl_surface.as_ref() else {
             return;
         };
-        with_surface_tree_downward(
-            surface,
-            (),
-            |_, _, _| TraversalAction::DoChildren(()),
-            |wl_surface, _, _| {
-                output_leave(output, &mut surface_list, wl_surface);
-            },
-            |_, _, _| true,
-        );
+        output_update(output, None, surface);
     }
 
     fn refresh(&self) {
@@ -85,7 +77,7 @@ impl SpaceElement for X11Surface {
         };
         for (weak, overlap) in wo_state.output_overlap.iter() {
             if let Some(output) = weak.upgrade() {
-                output_update(&output, *overlap, surface);
+                output_update(&output, Some(*overlap), surface);
             }
         }
     }

@@ -10,7 +10,7 @@ use smithay::backend::renderer::ImportEgl;
 #[cfg(feature = "debug")]
 use smithay::{
     backend::{allocator::Fourcc, renderer::ImportMem},
-    reexports::winit::platform::wayland::WindowExtWayland,
+    reexports::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle},
 };
 
 use smithay::{
@@ -20,27 +20,30 @@ use smithay::{
         renderer::{
             damage::{Error as OutputDamageTrackerError, OutputDamageTracker},
             element::AsRenderElements,
-            gles::{GlesRenderer, GlesTexture},
+            gles::GlesRenderer,
             ImportDma, ImportMemWl,
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
         SwapBuffersError,
     },
     delegate_dmabuf,
-    input::pointer::{CursorImageAttributes, CursorImageStatus},
+    input::{
+        keyboard::LedState,
+        pointer::{CursorImageAttributes, CursorImageStatus},
+    },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::EventLoop,
         wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
         wayland_server::{protocol::wl_surface, Display},
+        winit::platform::pump_events::PumpStatus,
     },
-    utils::{IsAlive, Point, Scale, Transform},
+    utils::{IsAlive, Scale, Transform},
     wayland::{
         compositor,
         dmabuf::{
-            DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportError,
+            DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
         },
-        input_method::InputMethodSeat,
     },
 };
 use tracing::{error, info, warn};
@@ -64,13 +67,18 @@ impl DmabufHandler for AnvilState<WinitData> {
         &mut self.backend_data.dmabuf_state.0
     }
 
-    fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf) -> Result<(), ImportError> {
-        self.backend_data
+    fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
+        if self
+            .backend_data
             .backend
             .renderer()
             .import_dmabuf(&dmabuf, None)
-            .map(|_| ())
-            .map_err(|_| ImportError::Failed)
+            .is_ok()
+        {
+            let _ = notifier.successful::<AnvilState<WinitData>>();
+        } else {
+            notifier.failed();
+        }
     }
 }
 delegate_dmabuf!(AnvilState<WinitData>);
@@ -83,11 +91,13 @@ impl Backend for WinitData {
         self.full_redraw = 4;
     }
     fn early_import(&mut self, _surface: &wl_surface::WlSurface) {}
+    fn update_led_state(&mut self, _led_state: LedState) {}
 }
 
 pub fn run_winit() {
     let mut event_loop = EventLoop::try_new().unwrap();
-    let mut display = Display::new().unwrap();
+    let display = Display::new().unwrap();
+    let mut display_handle = display.handle();
 
     #[cfg_attr(not(feature = "egl"), allow(unused_mut))]
     let (mut backend, mut winit) = match winit::init::<GlesRenderer>() {
@@ -97,7 +107,7 @@ pub fn run_winit() {
             return;
         }
     };
-    let size = backend.window_size().physical_size;
+    let size = backend.window_size();
 
     let mode = Mode {
         size,
@@ -189,7 +199,7 @@ pub fn run_winit() {
             fps: fps_ticker::Fps::default(),
         }
     };
-    let mut state = AnvilState::init(&mut display, event_loop.handle(), data, true);
+    let mut state = AnvilState::init(display, event_loop.handle(), data, true);
     state
         .shm_state
         .update_formats(state.backend_data.backend.renderer().shm_formats());
@@ -208,30 +218,29 @@ pub fn run_winit() {
 
     info!("Initialization completed, starting the main loop.");
 
-    let mut pointer_element = PointerElement::<GlesTexture>::default();
+    let mut pointer_element = PointerElement::default();
 
     while state.running.load(Ordering::SeqCst) {
-        if winit
-            .dispatch_new_events(|event| match event {
-                WinitEvent::Resized { size, .. } => {
-                    // We only have one output
-                    let output = state.space.outputs().next().unwrap().clone();
-                    state.space.map_output(&output, (0, 0));
-                    let mode = Mode {
-                        size,
-                        refresh: 60_000,
-                    };
-                    output.change_current_state(Some(mode), None, None, None);
-                    output.set_preferred(mode);
-                    crate::shell::fixup_positions(&mut state.space, state.pointer.current_location());
-                }
-                WinitEvent::Input(event) => {
-                    state.process_input_event_windowed(&display.handle(), event, OUTPUT_NAME)
-                }
-                _ => (),
-            })
-            .is_err()
-        {
+        let status = winit.dispatch_new_events(|event| match event {
+            WinitEvent::Resized { size, .. } => {
+                // We only have one output
+                let output = state.space.outputs().next().unwrap().clone();
+                state.space.map_output(&output, (0, 0));
+                let mode = Mode {
+                    size,
+                    refresh: 60_000,
+                };
+                output.change_current_state(Some(mode), None, None, None);
+                output.set_preferred(mode);
+                crate::shell::fixup_positions(&mut state.space, state.pointer.current_location());
+            }
+            WinitEvent::Input(event) => {
+                state.process_input_event_windowed(&display_handle, event, OUTPUT_NAME)
+            }
+            _ => (),
+        });
+
+        if let PumpStatus::Exit(_) = status {
             state.running.store(false, Ordering::SeqCst);
             break;
         }
@@ -249,7 +258,7 @@ pub fn run_winit() {
                 reset = !surface.alive();
             }
             if reset {
-                *cursor_guard = CursorImageStatus::Default;
+                *cursor_guard = CursorImageStatus::default_named();
             }
             let cursor_visible = !matches!(*cursor_guard, CursorImageStatus::Surface(_));
 
@@ -266,7 +275,6 @@ pub fn run_winit() {
             let damage_tracker = &mut state.backend_data.damage_tracker;
             let show_window_preview = state.show_window_preview;
 
-            let input_method = state.seat.input_method();
             let dnd_icon = state.dnd_icon.as_ref();
 
             let scale = Scale::from(output.current_scale().fractional_scale());
@@ -295,8 +303,15 @@ pub fn run_winit() {
                         backend.renderer().egl_context().get_context_handle(),
                         backend
                             .window()
-                            .wayland_surface()
-                            .unwrap_or_else(std::ptr::null_mut),
+                            .window_handle()
+                            .map(|handle| {
+                                if let RawWindowHandle::Wayland(handle) = handle.as_raw() {
+                                    handle.surface.as_ptr()
+                                } else {
+                                    std::ptr::null_mut()
+                                }
+                            })
+                            .unwrap_or_else(|_| std::ptr::null_mut()),
                     );
                 }
                 let age = if *full_redraw > 0 {
@@ -310,22 +325,6 @@ pub fn run_winit() {
                 let mut elements = Vec::<CustomRenderElements<GlesRenderer>>::new();
 
                 elements.extend(pointer_element.render_elements(renderer, cursor_pos_scaled, scale, 1.0));
-
-                // draw input method surface if any
-                let rectangle = input_method.coordinates();
-                let position = Point::from((
-                    rectangle.loc.x + rectangle.size.w,
-                    rectangle.loc.y + rectangle.size.h,
-                ));
-                input_method.with_surface(|surface| {
-                    elements.extend(AsRenderElements::<GlesRenderer>::render_elements(
-                        &smithay::desktop::space::SurfaceTree::from_surface(surface),
-                        renderer,
-                        position.to_physical_precise_round(scale),
-                        scale,
-                        1.0,
-                    ));
-                });
 
                 // draw the dnd icon if any
                 if let Some(surface) = dnd_icon {
@@ -373,8 +372,15 @@ pub fn run_winit() {
                             backend.renderer().egl_context().get_context_handle(),
                             backend
                                 .window()
-                                .wayland_surface()
-                                .unwrap_or_else(std::ptr::null_mut),
+                                .window_handle()
+                                .map(|handle| {
+                                    if let RawWindowHandle::Wayland(handle) = handle.as_raw() {
+                                        handle.surface.as_ptr()
+                                    } else {
+                                        std::ptr::null_mut()
+                                    }
+                                })
+                                .unwrap_or_else(|_| std::ptr::null_mut()),
                         );
                     }
 
@@ -405,8 +411,15 @@ pub fn run_winit() {
                             backend.renderer().egl_context().get_context_handle(),
                             backend
                                 .window()
-                                .wayland_surface()
-                                .unwrap_or_else(std::ptr::null_mut),
+                                .window_handle()
+                                .map(|handle| {
+                                    if let RawWindowHandle::Wayland(handle) = handle.as_raw() {
+                                        handle.surface.as_ptr()
+                                    } else {
+                                        std::ptr::null_mut()
+                                    }
+                                })
+                                .unwrap_or_else(|_| std::ptr::null_mut()),
                         );
                     }
 
@@ -417,16 +430,22 @@ pub fn run_winit() {
             }
         }
 
-        let mut calloop_data = CalloopData { state, display };
+        let mut calloop_data = CalloopData {
+            state,
+            display_handle,
+        };
         let result = event_loop.dispatch(Some(Duration::from_millis(1)), &mut calloop_data);
-        CalloopData { state, display } = calloop_data;
+        CalloopData {
+            state,
+            display_handle,
+        } = calloop_data;
 
         if result.is_err() {
             state.running.store(false, Ordering::SeqCst);
         } else {
             state.space.refresh();
             state.popups.cleanup();
-            display.flush_clients().unwrap();
+            display_handle.flush_clients().unwrap();
         }
 
         #[cfg(feature = "debug")]

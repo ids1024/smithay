@@ -7,7 +7,8 @@
 //! To use this functionality you must first spawn an [`XWayland`](super::XWayland) instance to attach a [`X11Wm`] to.
 //!
 //! ```no_run
-//! #  use smithay::xwayland::{XWayland, XWaylandEvent, X11Wm, X11Surface, XwmHandler, xwm::{XwmId, ResizeEdge, Reorder, SelectionType}};
+//! #  use smithay::wayland::selection::SelectionTarget;
+//! #  use smithay::xwayland::{XWayland, XWaylandEvent, X11Wm, X11Surface, XwmHandler, xwm::{XwmId, ResizeEdge, Reorder}};
 //! #  use smithay::utils::{Rectangle, Logical};
 //! #  use std::os::unix::io::OwnedFd;
 //! #
@@ -27,7 +28,7 @@
 //!     fn configure_notify(&mut self, xwm: XwmId, window: X11Surface, geometry: Rectangle<i32, Logical>, above: Option<u32>) { /* ... */ }
 //!     fn resize_request(&mut self, xwm: XwmId, window: X11Surface, button: u32, resize_edge: ResizeEdge) { /* ... */ }
 //!     fn move_request(&mut self, xwm: XwmId, window: X11Surface, button: u32) { /* ... */ }
-//!     fn send_selection(&mut self, xwm: XwmId, selection: SelectionType, mime_type: String, fd: OwnedFd) { /* ... */ }
+//!     fn send_selection(&mut self, xwm: XwmId, selection: SelectionTarget, mime_type: String, fd: OwnedFd) { /* ... */ }
 //! }
 //! #
 //! # let dh = unreachable!();
@@ -65,16 +66,19 @@
 
 use crate::{
     utils::{x11rb::X11Source, Logical, Point, Rectangle, Size},
-    wayland::compositor::{get_role, give_role},
+    wayland::{
+        compositor::{get_role, give_role},
+        selection::SelectionTarget,
+    },
 };
 use calloop::{generic::Generic, Interest, LoopHandle, Mode, PostAction, RegistrationToken};
-use nix::fcntl::OFlag;
+use rustix::fs::OFlags;
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap},
     fmt,
     os::unix::{
-        io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+        io::{AsFd, BorrowedFd, OwnedFd},
         net::UnixStream,
     },
     sync::Arc,
@@ -90,11 +94,11 @@ use x11rb::{
         render::{ConnectionExt as _, CreatePictureAux, PictureWrapper},
         xfixes::{ConnectionExt as _, SelectionEventMask},
         xproto::{
-            Atom, AtomEnum, ChangeWindowAttributesAux, ConfigWindow, ConfigureWindowAux, ConnectionExt as _,
-            CreateGCAux, CreateWindowAux, CursorWrapper, EventMask, FontWrapper, GcontextWrapper,
-            GetPropertyReply, ImageFormat, PixmapWrapper, PropMode, Property, QueryExtensionReply, Screen,
-            SelectionNotifyEvent, SelectionRequestEvent, StackMode, Window as X11Window, WindowClass,
-            SELECTION_NOTIFY_EVENT,
+            Atom, AtomEnum, ChangeWindowAttributesAux, ConfigWindow, ConfigureNotifyEvent,
+            ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, CursorWrapper, EventMask,
+            FontWrapper, GcontextWrapper, GetPropertyReply, ImageFormat, PixmapWrapper, PropMode, Property,
+            QueryExtensionReply, Screen, SelectionNotifyEvent, SelectionRequestEvent, StackMode,
+            Window as X11Window, WindowClass, CONFIGURE_NOTIFY_EVENT, SELECTION_NOTIFY_EVENT,
         },
         Event,
     },
@@ -151,6 +155,7 @@ mod atoms {
             _NET_WM_WINDOW_TYPE_UTILITY,
             _NET_WM_STATE_MODAL,
             _MOTIF_WM_HINTS,
+            _NET_STARTUP_ID,
 
             // server -> client
             WM_S0,
@@ -210,26 +215,17 @@ enum StackingDirection {
 impl StackingDirection {
     fn pos_comparator(&self, pos: usize, last_pos: usize) -> bool {
         match self {
-            Self::Downwards => last_pos > pos,
-            Self::Upwards => last_pos < pos,
+            Self::Downwards => last_pos < pos,
+            Self::Upwards => last_pos > pos,
         }
     }
 
     fn stack_mode(&self) -> StackMode {
         match self {
-            Self::Downwards => StackMode::ABOVE,
-            Self::Upwards => StackMode::BELOW,
+            Self::Downwards => StackMode::BELOW,
+            Self::Upwards => StackMode::ABOVE,
         }
     }
-}
-
-/// Type of a given Selection
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SelectionType {
-    /// Clipboard selection
-    Clipboard,
-    /// Primary selection
-    Primary,
 }
 
 /// Handler trait for X11Wm interactions
@@ -332,24 +328,24 @@ pub trait XwmHandler {
     fn move_request(&mut self, xwm: XwmId, window: X11Surface, button: u32);
 
     /// Window requests access to the given selection.
-    fn allow_selection_access(&mut self, xwm: XwmId, selection: SelectionType) -> bool {
+    fn allow_selection_access(&mut self, xwm: XwmId, selection: SelectionTarget) -> bool {
         let _ = (xwm, selection);
         false
     }
 
     /// The given selection is being read by an X client and needs to be written to the provided file descriptor
-    fn send_selection(&mut self, xwm: XwmId, selection: SelectionType, mime_type: String, fd: OwnedFd) {
+    fn send_selection(&mut self, xwm: XwmId, selection: SelectionTarget, mime_type: String, fd: OwnedFd) {
         let _ = (xwm, selection, mime_type, fd);
         panic!("`allow_selection_access` returned true without `send_selection` implementation to handle transfers.");
     }
 
     /// A new selection was set by an X client with provided mime_types
-    fn new_selection(&mut self, xwm: XwmId, selection: SelectionType, mime_types: Vec<String>) {
+    fn new_selection(&mut self, xwm: XwmId, selection: SelectionTarget, mime_types: Vec<String>) {
         let _ = (xwm, selection, mime_types);
     }
 
     /// A proviously set selection of an X client got cleared
-    fn cleared_selection(&mut self, xwm: XwmId, selection: SelectionType) {
+    fn cleared_selection(&mut self, xwm: XwmId, selection: SelectionTarget) {
         let _ = (xwm, selection);
     }
 }
@@ -393,7 +389,7 @@ impl Drop for X11Wm {
 #[derive(Debug)]
 struct XWmSelection {
     atom: Atom,
-    type_: SelectionType,
+    type_: SelectionTarget,
 
     conn: Arc<RustConnection>,
     window: X11Window,
@@ -438,7 +434,7 @@ impl IncomingTransfer {
             return Ok(true);
         }
 
-        let len = nix::unistd::write(fd.as_raw_fd(), &self.source_data)?;
+        let len = rustix::io::write(fd, &self.source_data)?;
         self.source_data = self.source_data.split_off(len);
 
         Ok(self.source_data.is_empty())
@@ -563,8 +559,8 @@ impl XWmSelection {
         conn.flush()?;
 
         let selection = match atom {
-            x if x == atoms.CLIPBOARD => SelectionType::Clipboard,
-            x if x == atoms.PRIMARY => SelectionType::Primary,
+            x if x == atoms.CLIPBOARD => SelectionTarget::Clipboard,
+            x if x == atoms.PRIMARY => SelectionTarget::Primary,
             _ => unreachable!(),
         };
 
@@ -684,7 +680,7 @@ impl X11Wm {
 
         // Create an X11 connection. XWayland only uses screen 0.
         let screen = 0;
-        let stream = DefaultStream::from_unix_stream(connection)?;
+        let stream = DefaultStream::from_unix_stream(connection)?.0;
         let conn = RustConnection::connect_to_stream(stream, screen)?;
         let atoms = Atoms::new(&conn)?.reply()?;
 
@@ -1111,12 +1107,12 @@ impl X11Wm {
     /// `mime_types` being `None` indicate there is no active selection anymore.
     pub fn new_selection(
         &mut self,
-        selection: SelectionType,
+        selection: SelectionTarget,
         mime_types: Option<Vec<String>>,
     ) -> Result<(), ReplyOrIdError> {
         let selection = match selection {
-            SelectionType::Clipboard => &mut self.clipboard,
-            SelectionType::Primary => &mut self.primary,
+            SelectionTarget::Clipboard => &mut self.clipboard,
+            SelectionTarget::Primary => &mut self.primary,
         };
 
         if let Some(mime_types) = mime_types {
@@ -1135,7 +1131,7 @@ impl X11Wm {
     /// Request to transfer the active `selection` for the provided `mime_type` to the provided file descriptor.
     pub fn send_selection<D>(
         &mut self,
-        selection: SelectionType,
+        selection: SelectionTarget,
         mime_type: String,
         fd: OwnedFd,
         loop_handle: LoopHandle<'_, D>,
@@ -1143,12 +1139,10 @@ impl X11Wm {
     where
         D: XwmHandler + 'static,
     {
-        use nix::fcntl::{fcntl, FcntlArg};
-
         let xwm_id = self.id();
         let selection = match selection {
-            SelectionType::Clipboard => &mut self.clipboard,
-            SelectionType::Primary => &mut self.primary,
+            SelectionTarget::Clipboard => &mut self.clipboard,
+            SelectionTarget::Primary => &mut self.primary,
         };
 
         info!(
@@ -1212,10 +1206,7 @@ impl X11Wm {
             x11rb::CURRENT_TIME,
         )?;
 
-        if let Err(err) = fcntl(
-            fd.as_raw_fd(),
-            FcntlArg::F_SETFL(OFlag::O_WRONLY | OFlag::O_NONBLOCK),
-        ) {
+        if let Err(err) = rustix::fs::fcntl_setfl(&fd, OFlags::WRONLY | OFlags::NONBLOCK) {
             warn!(?err, "Failed to restrict wl file descriptor");
         }
 
@@ -1229,8 +1220,8 @@ impl X11Wm {
                     let conn = &xwm.conn;
                     let atoms = &xwm.atoms;
                     let selection = match selection_type {
-                        SelectionType::Clipboard => &mut xwm.clipboard,
-                        SelectionType::Primary => &mut xwm.primary,
+                        SelectionTarget::Clipboard => &mut xwm.clipboard,
+                        SelectionTarget::Primary => &mut xwm.primary,
                     };
                     if let Some(transfer) = selection
                         .incoming
@@ -1782,8 +1773,8 @@ fn handle_event<D: XwmHandler + 'static>(
             let allow_access = state.allow_selection_access(xwm_id, selection_type);
             let xwm = state.xwm_state(xwm_id);
             let selection = match selection_type {
-                SelectionType::Clipboard => &mut xwm.clipboard,
-                SelectionType::Primary => &mut xwm.primary,
+                SelectionTarget::Clipboard => &mut xwm.clipboard,
+                SelectionTarget::Primary => &mut xwm.primary,
             };
 
             let _guard = xwm.span.enter();
@@ -1885,10 +1876,10 @@ fn handle_event<D: XwmHandler + 'static>(
                             }
                         };
 
-                        let (recv_fd, send_fd) = nix::unistd::pipe2(OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)
-                            .map_err(|err| {
-                                ConnectionError::IoError(std::io::Error::from_raw_os_error(err as i32))
-                            })?;
+                        let (recv_fd, send_fd) = rustix::pipe::pipe_with(
+                            rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
+                        )
+                        .map_err(|err| ConnectionError::IoError(std::io::Error::from(err)))?;
 
                         // It seems that if we ever try to reply to a selection request after
                         // another has been sent by the same requestor, the requestor never reads
@@ -1912,17 +1903,14 @@ fn handle_event<D: XwmHandler + 'static>(
                         }
 
                         let requestor = n.requestor;
-                        let token = match loop_handle.insert_source(
-                            Generic::new(
-                                unsafe { OwnedFd::from_raw_fd(recv_fd) },
-                                Interest::READ,
-                                Mode::Level,
-                            ),
+
+                        let token = loop_handle.insert_source(
+                            Generic::new(recv_fd, Interest::READ, Mode::Level),
                             move |_, fd, data| {
                                 let xwm = data.xwm_state(xwm_id);
                                 let selection = match selection_type {
-                                    SelectionType::Clipboard => &mut xwm.clipboard,
-                                    SelectionType::Primary => &mut xwm.primary,
+                                    SelectionTarget::Clipboard => &mut xwm.clipboard,
+                                    SelectionTarget::Primary => &mut xwm.primary,
                                 };
 
                                 if let Some(transfer) = selection
@@ -1945,7 +1933,9 @@ fn handle_event<D: XwmHandler + 'static>(
 
                                 Ok(PostAction::Remove)
                             },
-                        ) {
+                        );
+
+                        let token = match token {
                             Ok(token) => token,
                             Err(err) => {
                                 warn!(
@@ -1977,9 +1967,7 @@ fn handle_event<D: XwmHandler + 'static>(
 
                         let selection_type = selection.type_;
                         drop(_guard);
-                        state.send_selection(xwm_id, selection_type, mime_type, unsafe {
-                            OwnedFd::from_raw_fd(send_fd)
-                        });
+                        state.send_selection(xwm_id, selection_type, mime_type, send_fd);
                     }
                 }
             } else {
@@ -2150,9 +2138,14 @@ fn handle_event<D: XwmHandler + 'static>(
                     }
                 }
                 x if x == xwm.atoms.WM_CHANGE_STATE => {
+                    let data = msg.data.as_data32();
                     if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == msg.window).cloned() {
                         drop(_guard);
-                        state.minimize_request(xwm_id, surface);
+                        match data[0] {
+                            1 => state.unminimize_request(xwm_id, surface),
+                            3 => state.minimize_request(xwm_id, surface),
+                            _ => {}
+                        }
                     }
                 }
                 x if x == xwm.atoms._NET_WM_STATE => {
@@ -2274,7 +2267,7 @@ fn read_selection_callback(
     transfer: &mut OutgoingTransfer,
 ) -> Result<OutgoingAction, ReplyOrIdError> {
     let mut buf = [0; INCR_CHUNK_SIZE];
-    let Ok(len) = nix::unistd::read(fd.as_raw_fd(), &mut buf) else {
+    let Ok(len) = rustix::io::read(fd, &mut buf) else {
         debug!(
             requestor = transfer.request.requestor,
             "File descriptor closed, aborting transfer."
@@ -2401,6 +2394,34 @@ fn send_selection_notify_resp(
             } else {
                 AtomEnum::NONE.into()
             },
+        },
+    )?;
+    conn.flush()?;
+    Ok(())
+}
+
+fn send_configure_notify(
+    conn: &RustConnection,
+    win: &X11Window,
+    geometry: Rectangle<i32, Logical>,
+    override_redirect: bool,
+) -> Result<(), ConnectionError> {
+    conn.send_event(
+        false,
+        *win,
+        EventMask::STRUCTURE_NOTIFY,
+        ConfigureNotifyEvent {
+            response_type: CONFIGURE_NOTIFY_EVENT,
+            sequence: 0,
+            event: *win,
+            window: *win,
+            above_sibling: x11rb::NONE,
+            x: geometry.loc.x as i16,
+            y: geometry.loc.y as i16,
+            width: geometry.size.w as u16,
+            height: geometry.size.h as u16,
+            border_width: 0,
+            override_redirect,
         },
     )?;
     conn.flush()?;

@@ -25,6 +25,9 @@ pub mod gles;
 #[cfg(feature = "renderer_glow")]
 pub mod glow;
 
+#[cfg(feature = "renderer_pixman")]
+pub mod pixman;
+
 use crate::backend::allocator::{dmabuf::Dmabuf, Format, Fourcc};
 #[cfg(all(
     feature = "wayland_frontend",
@@ -46,6 +49,9 @@ pub mod damage;
 
 pub mod sync;
 
+#[cfg(feature = "renderer_test")]
+pub mod test;
+
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 /// Texture filtering methods
 pub enum TextureFilter {
@@ -64,9 +70,9 @@ impl Transform {
             Transform::_180 => Matrix3::new(-1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0),
             Transform::_270 => Matrix3::new(0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
             Transform::Flipped => Matrix3::new(-1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
-            Transform::Flipped90 => Matrix3::new(0.0, -1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+            Transform::Flipped90 => Matrix3::new(0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
             Transform::Flipped180 => Matrix3::new(1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0),
-            Transform::Flipped270 => Matrix3::new(0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+            Transform::Flipped270 => Matrix3::new(0.0, -1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
         }
     }
 }
@@ -483,6 +489,11 @@ pub trait ImportDma: Renderer {
         Box::new(std::iter::empty())
     }
 
+    /// Test if a specific dmabuf [`Format`] is supported
+    fn has_dmabuf_format(&self, format: Format) -> bool {
+        self.dmabuf_formats().any(|f| f == format)
+    }
+
     /// Import a given raw dmabuf into the renderer.
     ///
     /// Returns a texture_id, which can be used with [`Frame::render_texture_from_to`] (or [`Frame::render_texture_at`])
@@ -540,6 +551,7 @@ pub trait ImportAll: Renderer {
     feature = "use_system_lib"
 ))]
 impl<R: Renderer + ImportMemWl + ImportEgl + ImportDmaWl> ImportAll for R {
+    #[profiling::function]
     fn import_buffer(
         &mut self,
         buffer: &wl_buffer::WlBuffer,
@@ -610,6 +622,17 @@ pub trait ExportMem: Renderer {
         region: Rectangle<i32, BufferCoord>,
         format: Fourcc,
     ) -> Result<Self::TextureMapping, Self::Error>;
+
+    /// Returns whether the renderer should be able to read-back from the given texture.
+    ///
+    /// No actual copying shall be performed by this function nor is a format specified,
+    /// so it is still legal for [`ExportMem::copy_texture`] to return an error, if this
+    /// method returns `true`.
+    ///
+    /// This function *may* fail, if:
+    /// - A readability test did successfully complete (not that it returned `unreadble`!)
+    /// - Any of the state of the renderer is irrevesibly changed
+    fn can_read_texture(&mut self, texture: &Self::TextureId) -> Result<bool, Self::Error>;
 
     /// Returns a read-only pointer to a previously created texture mapping.
     ///
@@ -805,6 +828,7 @@ pub fn buffer_dimensions(buffer: &wl_buffer::WlBuffer) -> Option<Size<i32, Buffe
 ///
 /// *Note*: This will only return y-inverted for buffer types known to smithay (see [`buffer_type`])
 #[cfg(feature = "wayland_frontend")]
+#[profiling::function]
 pub fn buffer_y_inverted(buffer: &wl_buffer::WlBuffer) -> Option<bool> {
     if let Ok(dmabuf) = crate::wayland::dmabuf::get_dmabuf(buffer) {
         return Some(dmabuf.y_inverted());

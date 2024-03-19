@@ -10,9 +10,11 @@ use crate::Smallvil;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
-use smithay::wayland::data_device::{
-    set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, ServerDndGrabHandler,
+use smithay::wayland::output::OutputHandler;
+use smithay::wayland::selection::data_device::{
+    set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
 };
+use smithay::wayland::selection::SelectionHandler;
 use smithay::{delegate_data_device, delegate_output, delegate_seat};
 
 impl SeatHandler for Smallvil {
@@ -38,9 +40,12 @@ delegate_seat!(Smallvil);
 // Wl Data Device
 //
 
-impl DataDeviceHandler for Smallvil {
+impl SelectionHandler for Smallvil {
     type SelectionUserData = ();
-    fn data_device_state(&self) -> &smithay::wayland::data_device::DataDeviceState {
+}
+
+impl DataDeviceHandler for Smallvil {
+    fn data_device_state(&self) -> &DataDeviceState {
         &self.data_device_state
     }
 }
@@ -54,4 +59,5 @@ delegate_data_device!(Smallvil);
 // Wl Output & Xdg Output
 //
 
+impl OutputHandler for Smallvil {}
 delegate_output!(Smallvil);

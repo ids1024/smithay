@@ -7,7 +7,7 @@ static POSSIBLE_BACKENDS: &[&str] = &[
     "--x11 : Run anvil as an X11 client.",
 ];
 
-#[cfg(feature = "profile-with-tracy")]
+#[cfg(feature = "profile-with-tracy-mem")]
 #[global_allocator]
 static GLOBAL: profiling::tracy_client::ProfiledAllocator<std::alloc::System> =
     profiling::tracy_client::ProfiledAllocator::new(std::alloc::System, 10);
@@ -53,11 +53,14 @@ fn main() {
             tracing::error!("Unknown backend: {}", other);
         }
         None => {
-            println!("USAGE: anvil --backend");
-            println!();
-            println!("Possible backends are:");
-            for b in POSSIBLE_BACKENDS {
-                println!("\t{}", b);
+            #[allow(clippy::disallowed_macros)]
+            {
+                println!("USAGE: anvil --backend");
+                println!();
+                println!("Possible backends are:");
+                for b in POSSIBLE_BACKENDS {
+                    println!("\t{}", b);
+                }
             }
         }
     }

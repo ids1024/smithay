@@ -12,15 +12,19 @@
 
 use calloop::generic::Generic;
 use calloop::{EventSource, Interest, Mode, PostAction};
-use nix::poll;
+use rustix::ioctl::{Setter, WriteOpcode};
 
 use super::{Allocator, Buffer, Format, Fourcc, Modifier};
+#[cfg(feature = "backend_drm")]
+use crate::backend::drm::DrmNode;
 use crate::utils::{Buffer as BufferCoords, Size};
 #[cfg(feature = "wayland_frontend")]
 use crate::wayland::compositor::{Blocker, BlockerState};
 use std::hash::{Hash, Hasher};
-use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "backend_drm")]
+use std::sync::Mutex;
 use std::sync::{Arc, Weak};
 use std::{error, fmt};
 
@@ -35,10 +39,17 @@ pub(crate) struct DmabufInternal {
     pub size: Size<i32, BufferCoords>,
     /// The format in use
     pub format: Fourcc,
+    /// Format modifier
+    pub modifier: Modifier,
     /// The flags applied to it
     ///
     /// This is a bitflag, to be compared with the `Flags` enum re-exported by this module.
     pub flags: DmabufFlags,
+    /// Presumably compatible device for buffer import
+    ///
+    /// This is inferred from client apis, however there is no kernel api or guarantee this is correct
+    #[cfg(feature = "backend_drm")]
+    node: Mutex<Option<DrmNode>>,
 }
 
 #[derive(Debug)]
@@ -50,8 +61,6 @@ pub(crate) struct Plane {
     pub offset: u32,
     /// Stride for this plane
     pub stride: u32,
-    /// Modifier for this plane
-    pub modifier: Modifier,
 }
 
 impl From<Plane> for OwnedFd {
@@ -80,6 +89,19 @@ pub struct Dmabuf(pub(crate) Arc<DmabufInternal>);
 #[derive(Debug, Clone)]
 /// Weak reference to a dmabuf handle
 pub struct WeakDmabuf(pub(crate) Weak<DmabufInternal>);
+
+// A reference to a particular dmabuf plane fd, so it can be used as a calloop source.
+#[derive(Debug)]
+struct PlaneRef {
+    dmabuf: Dmabuf,
+    idx: usize,
+}
+
+impl AsFd for PlaneRef {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.dmabuf.0.planes[self.idx].fd.as_fd()
+    }
+}
 
 impl PartialEq for Dmabuf {
     fn eq(&self, other: &Self) -> bool {
@@ -114,7 +136,7 @@ impl Buffer for Dmabuf {
     fn format(&self) -> Format {
         Format {
             code: self.0.format,
-            modifier: self.0.planes[0].modifier,
+            modifier: self.0.modifier,
         }
     }
 }
@@ -130,7 +152,7 @@ impl DmabufBuilder {
     ///
     /// *Note*: Each Dmabuf needs at least one plane.
     /// MAX_PLANES notes the maximum amount of planes any format may use with this implementation.
-    pub fn add_plane(&mut self, fd: OwnedFd, idx: u32, offset: u32, stride: u32, modifier: Modifier) -> bool {
+    pub fn add_plane(&mut self, fd: OwnedFd, idx: u32, offset: u32, stride: u32) -> bool {
         if self.internal.planes.len() == MAX_PLANES {
             return false;
         }
@@ -139,10 +161,18 @@ impl DmabufBuilder {
             plane_idx: idx,
             offset,
             stride,
-            modifier,
         });
 
         true
+    }
+
+    /// Sets a known good node to import the dmabuf with.
+    ///
+    /// While this is only a strong hint and no guarantee, implementations
+    /// should avoid setting this at all, if they can't be reasonably certain.
+    #[cfg(feature = "backend_drm")]
+    pub fn set_node(&mut self, node: DrmNode) {
+        self.internal.node = Mutex::new(Some(node));
     }
 
     /// Build a `Dmabuf` out of the provided parameters and planes
@@ -165,20 +195,14 @@ impl Dmabuf {
     // The contents are determined by the provided file descriptors, which
     // do not need to refer to the same buffer `src` does.
     pub fn builder_from_buffer(src: &impl Buffer, flags: DmabufFlags) -> DmabufBuilder {
-        DmabufBuilder {
-            internal: DmabufInternal {
-                planes: Vec::with_capacity(MAX_PLANES),
-                size: src.size(),
-                format: src.format().code,
-                flags,
-            },
-        }
+        Self::builder(src.size(), src.format().code, src.format().modifier, flags)
     }
 
     /// Create a new Dmabuf builder
     pub fn builder(
         size: impl Into<Size<i32, BufferCoords>>,
         format: Fourcc,
+        modifier: Modifier,
         flags: DmabufFlags,
     ) -> DmabufBuilder {
         DmabufBuilder {
@@ -186,7 +210,10 @@ impl Dmabuf {
                 planes: Vec::with_capacity(MAX_PLANES),
                 size: size.into(),
                 format,
+                modifier,
                 flags,
+                #[cfg(feature = "backend_drm")]
+                node: Mutex::new(None),
             },
         }
     }
@@ -213,7 +240,7 @@ impl Dmabuf {
 
     /// Returns if this buffer format has any vendor-specific modifiers set or is implicit/linear
     pub fn has_modifier(&self) -> bool {
-        self.0.planes[0].modifier != Modifier::Invalid && self.0.planes[0].modifier != Modifier::Linear
+        self.0.modifier != Modifier::Invalid && self.0.modifier != Modifier::Linear
     }
 
     /// Returns if the buffer is stored inverted on the y-axis
@@ -224,6 +251,23 @@ impl Dmabuf {
     /// Create a weak reference to this dmabuf
     pub fn weak(&self) -> WeakDmabuf {
         WeakDmabuf(Arc::downgrade(&self.0))
+    }
+
+    /// Presumably compatible device for buffer import
+    ///
+    /// This is inferred from client apis, as there is no kernel api or other guarantee this is correct,
+    /// so it should only be treated as a hint.
+    #[cfg(feature = "backend_drm")]
+    pub fn node(&self) -> Option<DrmNode> {
+        *self.0.node.lock().unwrap()
+    }
+
+    /// Sets or unsets any node set for this dmabuf (see [`Dmabuf::node`]).
+    ///
+    /// May alter behavior of other parts of smithay using this as a hint.
+    #[cfg(feature = "backend_drm")]
+    pub fn set_node(&self, node: impl Into<Option<DrmNode>>) {
+        *self.0.node.lock().unwrap() = node.into();
     }
 
     /// Create an [`calloop::EventSource`] and [`crate::wayland::compositor::Blocker`] for this [`Dmabuf`].
@@ -238,6 +282,152 @@ impl Dmabuf {
         let source = DmabufSource::new(self.clone(), interest)?;
         let blocker = DmabufBlocker(source.signal.clone());
         Ok((blocker, source))
+    }
+
+    /// Map the plane at specified index with the specified mode
+    ///
+    /// Returns `Err` if the plane with the specified index does not exist or
+    /// mmap failed
+    pub fn map_plane(
+        &self,
+        idx: usize,
+        mode: DmabufMappingMode,
+    ) -> Result<DmabufMapping, DmabufMappingFailed> {
+        let plane = self
+            .0
+            .planes
+            .get(idx)
+            .ok_or(DmabufMappingFailed::PlaneIndexOutOfBound)?;
+
+        let size = rustix::fs::seek(&plane.fd, rustix::fs::SeekFrom::End(0)).map_err(std::io::Error::from)?;
+        rustix::fs::seek(&plane.fd, rustix::fs::SeekFrom::Start(0)).map_err(std::io::Error::from)?;
+
+        let len = (size - plane.offset as u64) as usize;
+        let ptr = unsafe {
+            rustix::mm::mmap(
+                std::ptr::null_mut(),
+                len,
+                mode.into(),
+                rustix::mm::MapFlags::SHARED,
+                &plane.fd,
+                plane.offset as u64,
+            )
+        }
+        .map_err(std::io::Error::from)?;
+        Ok(DmabufMapping { len, ptr })
+    }
+
+    /// Synchronize access for the plane at the specified index
+    ///
+    /// Returns `Err` if the plane with the specified index does not exist or
+    /// the dmabuf_sync ioctl failed
+    pub fn sync_plane(&self, idx: usize, flags: DmabufSyncFlags) -> Result<(), DmabufSyncFailed> {
+        let plane = self
+            .0
+            .planes
+            .get(idx)
+            .ok_or(DmabufSyncFailed::PlaneIndexOutOfBound)?;
+        unsafe { rustix::ioctl::ioctl(&plane.fd, Setter::<DmaBufSync, _>::new(dma_buf_sync { flags })) }
+            .map_err(std::io::Error::from)?;
+        Ok(())
+    }
+}
+
+bitflags::bitflags! {
+    /// Modes of mapping a dmabuf plane
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct DmabufMappingMode: u32 {
+        /// Map the dmabuf readable
+        const READ = 0b00000001;
+        /// Map the dmabuf writable
+        const WRITE = 0b00000010;
+    }
+}
+
+impl From<DmabufMappingMode> for rustix::mm::ProtFlags {
+    fn from(mode: DmabufMappingMode) -> Self {
+        let mut flags = rustix::mm::ProtFlags::empty();
+
+        if mode.contains(DmabufMappingMode::READ) {
+            flags |= rustix::mm::ProtFlags::READ;
+        }
+
+        if mode.contains(DmabufMappingMode::WRITE) {
+            flags |= rustix::mm::ProtFlags::WRITE;
+        }
+
+        flags
+    }
+}
+
+/// Dmabuf mapping errors
+#[derive(Debug, thiserror::Error)]
+#[error("Mapping the dmabuf failed")]
+pub enum DmabufMappingFailed {
+    /// The supplied index for the plane is out of bounds
+    #[error("The supplied index for the plane is out of bounds")]
+    PlaneIndexOutOfBound,
+    /// Io error during map operation
+    Io(#[from] std::io::Error),
+}
+
+/// Dmabuf sync errors
+#[derive(Debug, thiserror::Error)]
+#[error("Sync of the dmabuf failed")]
+pub enum DmabufSyncFailed {
+    /// The supplied index for the plane is out of bounds
+    #[error("The supplied index for the plane is out of bounds")]
+    PlaneIndexOutOfBound,
+    /// Io error during sync operation
+    Io(#[from] std::io::Error),
+}
+
+bitflags::bitflags! {
+    /// Flags for the [`Dmabuf::sync_plane`](Dmabuf::sync_plane) operation
+    #[derive(Copy, Clone)]
+    pub struct DmabufSyncFlags: std::ffi::c_ulonglong {
+        /// Read from the dmabuf
+        const READ = 1 << 0;
+        /// Write to the dmabuf
+        #[allow(clippy::identity_op)]
+        const WRITE = 2 << 0;
+        /// Start of read/write
+        const START = 0 << 2;
+        /// End of read/write
+        const END = 1 << 2;
+    }
+}
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+struct dma_buf_sync {
+    flags: DmabufSyncFlags,
+}
+
+type DmaBufSync = WriteOpcode<b'b', 0, dma_buf_sync>;
+
+/// A mapping into a [`Dmabuf`]
+#[derive(Debug)]
+pub struct DmabufMapping {
+    ptr: *mut std::ffi::c_void,
+    len: usize,
+}
+
+impl DmabufMapping {
+    /// Access the raw pointer of the mapping
+    pub fn ptr(&self) -> *mut std::ffi::c_void {
+        self.ptr
+    }
+
+    /// Access the length of the mapping
+    pub fn length(&self) -> usize {
+        self.len
+    }
+}
+
+impl Drop for DmabufMapping {
+    fn drop(&mut self) {
+        let _ = unsafe { rustix::mm::munmap(self.ptr, self.len) };
     }
 }
 
@@ -341,8 +531,8 @@ impl Blocker for DmabufBlocker {
 
 #[derive(Debug)]
 enum Subsource {
-    Active(Generic<RawFd, std::io::Error>),
-    Done(Generic<RawFd, std::io::Error>),
+    Active(Generic<PlaneRef, std::io::Error>),
+    Done(Generic<PlaneRef, std::io::Error>),
     Empty,
 }
 
@@ -396,16 +586,14 @@ impl DmabufSource {
             Subsource::Empty,
         ];
         for (idx, handle) in dmabuf.handles().enumerate() {
-            // SAFETY: This is stored together with the Dmabuf holding the owned file descriptors
-            let fd = handle.as_raw_fd();
             if matches!(
-                poll::poll(
-                    &mut [poll::PollFd::new(
-                        fd,
+                rustix::event::poll(
+                    &mut [rustix::event::PollFd::new(
+                        &handle,
                         if interest.writable {
-                            poll::PollFlags::POLLOUT
+                            rustix::event::PollFlags::OUT
                         } else {
-                            poll::PollFlags::POLLIN
+                            rustix::event::PollFlags::IN
                         },
                     )],
                     0
@@ -414,6 +602,10 @@ impl DmabufSource {
             ) {
                 continue;
             }
+            let fd = PlaneRef {
+                dmabuf: dmabuf.clone(),
+                idx,
+            };
             sources[idx] = Subsource::Active(Generic::new(fd, interest, Mode::OneShot));
         }
         if sources

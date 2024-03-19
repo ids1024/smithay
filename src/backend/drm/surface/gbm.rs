@@ -3,17 +3,19 @@ use std::os::unix::io::AsFd;
 use std::sync::Arc;
 
 use drm::control::{connector, crtc, plane, Mode};
+use drm::{Device, DriverCapability};
 use gbm::BufferObject;
 
 use crate::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
 use crate::backend::allocator::format::get_opaque;
 use crate::backend::allocator::gbm::GbmConvertError;
 use crate::backend::allocator::{Allocator, Format, Fourcc, Modifier, Slot, Swapchain};
+use crate::backend::drm::error::AccessError;
 use crate::backend::drm::gbm::{framebuffer_from_bo, GbmFramebuffer};
 use crate::backend::drm::{plane_has_property, DrmError, DrmSurface};
 use crate::backend::renderer::sync::SyncPoint;
 use crate::backend::SwapBuffersError;
-use crate::utils::{Physical, Point, Rectangle, Transform};
+use crate::utils::{DevPath, Physical, Point, Rectangle, Transform};
 
 use tracing::{debug, error, info_span, instrument, trace, warn};
 
@@ -71,8 +73,18 @@ where
             match Self::new_internal(drm.clone(), allocator, renderer_formats.clone(), *format) {
                 Ok((current_fb, swapchain, is_opaque)) => {
                     drop(_guard);
-                    let supports_fencing =
-                        !drm.is_legacy() && plane_has_property(&*drm, drm.plane(), "IN_FENCE_FD")?;
+                    let supports_fencing = !drm.is_legacy()
+                        && drm
+                            .get_driver_capability(DriverCapability::SyncObj)
+                            .map(|val| val != 0)
+                            .map_err(|err| {
+                                Error::DrmError(DrmError::Access(AccessError {
+                                    errmsg: "Failed to query driver capability",
+                                    dev: drm.dev_path(),
+                                    source: err,
+                                }))
+                            })?
+                        && plane_has_property(&*drm, drm.plane(), "IN_FENCE_FD")?;
 
                     return Ok(GbmBufferedSurface {
                         current_fb,

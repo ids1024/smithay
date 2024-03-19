@@ -1,7 +1,5 @@
 use std::sync::{atomic::AtomicBool, Mutex};
 
-use tracing::error;
-
 use wayland_protocols::wp::linux_dmabuf::zv1::server::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
 };
@@ -16,7 +14,7 @@ use crate::{
 
 use super::{
     DmabufData, DmabufFeedbackData, DmabufGlobal, DmabufGlobalData, DmabufHandler, DmabufParamsData,
-    DmabufState, ImportError, Modifier, SurfaceDmabufFeedbackState,
+    DmabufState, Import, ImportNotifier, Modifier, SurfaceDmabufFeedbackState,
 };
 
 impl<D> Dispatch<wl_buffer::WlBuffer, Dmabuf, D> for DmabufState
@@ -69,6 +67,7 @@ where
                         id: data.id,
                         used: AtomicBool::new(false),
                         formats: data.formats.clone(),
+                        modifier: Mutex::new(None),
                         planes: Mutex::new(Vec::with_capacity(MAX_PLANES)),
                     },
                 );
@@ -224,7 +223,7 @@ where
 {
     fn request(
         state: &mut D,
-        client: &Client,
+        _client: &Client,
         params: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
         request: zwp_linux_buffer_params_v1::Request,
         data: &DmabufParamsData,
@@ -266,14 +265,28 @@ where
                     return;
                 }
 
-                let modifier = ((modifier_hi as u64) << 32) + (modifier_lo as u64);
                 planes.push(Plane {
                     fd,
                     plane_idx,
                     offset,
                     stride,
-                    modifier: Modifier::from(modifier),
                 });
+
+                let modifier = Modifier::from(((modifier_hi as u64) << 32) + (modifier_lo as u64));
+                let mut data_modifier = data.modifier.lock().unwrap();
+                if let Some(data_modifier) = *data_modifier {
+                    if params.version() >= 5 && modifier != data_modifier {
+                        params.post_error(
+                            zwp_linux_buffer_params_v1::Error::InvalidFormat,
+                            format!(
+                                "Planes have non-matching modifiers: {:?} != {:?}",
+                                modifier, data_modifier
+                            ),
+                        );
+                    }
+                } else {
+                    *data_modifier = Some(modifier);
+                }
             }
 
             zwp_linux_buffer_params_v1::Request::Create {
@@ -283,35 +296,15 @@ where
                 flags,
             } => {
                 // create_dmabuf performs an implicit ensure_unused function call.
-                if let Some(dmabuf) = data.create_dmabuf(params, width, height, format, flags) {
+                if let Some(dmabuf) = data.create_dmabuf(params, width, height, format, flags, None) {
                     if state.dmabuf_state().globals.get(&data.id).is_some() {
-                        match state.dmabuf_imported(&DmabufGlobal { id: data.id }, dmabuf.clone()) {
-                            Ok(_) => {
-                                match client.create_resource::<wl_buffer::WlBuffer, Dmabuf, D>(dh, 1, dmabuf)
-                                {
-                                    Ok(buffer) => {
-                                        params.created(&buffer);
-                                    }
-
-                                    Err(_) => {
-                                        error!("failed to create protocol object for \"create\" request");
-                                        // Failed to import since the buffer protocol object could not be created.
-                                        params.failed();
-                                    }
-                                }
-                            }
-
-                            Err(ImportError::InvalidFormat) => {
-                                params.post_error(
-                                    zwp_linux_buffer_params_v1::Error::InvalidFormat,
-                                    "format and plane combination are not valid",
-                                );
-                            }
-
-                            Err(ImportError::Failed) => {
-                                params.failed();
-                            }
-                        }
+                        let notifier = ImportNotifier::new(
+                            params.clone(),
+                            dh.clone(),
+                            dmabuf.clone(),
+                            Import::Falliable,
+                        );
+                        state.dmabuf_imported(&DmabufGlobal { id: data.id }, dmabuf, notifier);
                     } else {
                         // If the dmabuf global was destroyed, we cannot import any buffers.
                         params.failed();
@@ -328,30 +321,17 @@ where
             } => {
                 // Client is killed if the if statement is not taken.
                 // create_dmabuf performs an implicit ensure_unused function call.
-                if let Some(dmabuf) = data.create_dmabuf(params, width, height, format, flags) {
+                if let Some(dmabuf) = data.create_dmabuf(params, width, height, format, flags, None) {
                     if state.dmabuf_state().globals.get(&data.id).is_some() {
-                        match state.dmabuf_imported(&DmabufGlobal { id: data.id }, dmabuf.clone()) {
-                            Ok(_) => {
-                                // Import was successful, initialize the dmabuf data
-                                data_init.init(buffer_id, dmabuf);
-                            }
-
-                            Err(ImportError::InvalidFormat) => {
-                                params.post_error(
-                                    zwp_linux_buffer_params_v1::Error::InvalidFormat,
-                                    "format and plane combination are not valid",
-                                );
-                            }
-
-                            Err(ImportError::Failed) => {
-                                // Buffer import failed. The protocol documentation heavily implies killing the
-                                // client is the right thing to do here.
-                                params.post_error(
-                                    zwp_linux_buffer_params_v1::Error::InvalidWlBuffer,
-                                    "buffer import failed",
-                                );
-                            }
-                        }
+                        // The buffer isn't technically valid during data_init, but the client is not allowed to use the buffer until ready.
+                        let buffer = data_init.init(buffer_id, dmabuf.clone());
+                        let notifier = ImportNotifier::new(
+                            params.clone(),
+                            dh.clone(),
+                            dmabuf.clone(),
+                            Import::Infallible(buffer),
+                        );
+                        state.dmabuf_imported(&DmabufGlobal { id: data.id }, dmabuf, notifier);
                     } else {
                         // Buffer import failed. The protocol documentation heavily implies killing the
                         // client is the right thing to do here.

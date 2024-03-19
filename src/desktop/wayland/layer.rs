@@ -28,12 +28,11 @@ use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use wayland_server::{
     backend::ObjectId,
     protocol::wl_surface::{self, WlSurface},
-    Resource, Weak,
+    Resource,
 };
 
 use std::{
     cell::{RefCell, RefMut},
-    collections::HashSet,
     hash::{Hash, Hasher},
     sync::{Arc, Mutex},
     time::Duration,
@@ -49,8 +48,6 @@ pub struct LayerMap {
     layers: IndexSet<LayerSurface>,
     output: WeakOutput,
     zone: Rectangle<i32, Logical>,
-    // surfaces for tracking enter and leave events
-    surfaces: HashSet<Weak<WlSurface>>,
 }
 
 /// Retrieve a [`LayerMap`] for a given [`Output`].
@@ -81,7 +78,6 @@ pub fn layer_map_for_output(o: &Output) -> RefMut<'_, LayerMap> {
                     })
                     .unwrap_or_else(|| (0, 0).into()),
             ),
-            surfaces: HashSet::new(),
         })
     });
     userdata.get::<RefCell<LayerMap>>().unwrap().borrow_mut()
@@ -125,11 +121,7 @@ impl LayerMap {
                 (),
                 |_, _, _| TraversalAction::DoChildren(()),
                 |wl_surface, _, _| {
-                    let weak = wl_surface.downgrade();
-                    if self.surfaces.contains(&weak) {
-                        output.leave(wl_surface);
-                        self.surfaces.remove(&weak);
-                    }
+                    output.leave(wl_surface);
                 },
                 |_, _, _| true,
             );
@@ -140,11 +132,7 @@ impl LayerMap {
                     (),
                     |_, _, _| TraversalAction::DoChildren(()),
                     |wl_surface, _, _| {
-                        let weak = wl_surface.downgrade();
-                        if self.surfaces.contains(&weak) {
-                            output.leave(wl_surface);
-                            self.surfaces.remove(&weak);
-                        }
+                        output.leave(wl_surface);
                     },
                     |_, _, _| true,
                 )
@@ -276,17 +264,12 @@ impl LayerMap {
             for layer in self.layers.iter() {
                 let surface = layer.wl_surface();
 
-                let surfaces_ref = &mut self.surfaces;
                 with_surface_tree_downward(
                     surface,
                     (),
                     |_, _, _| TraversalAction::DoChildren(()),
                     |wl_surface, _, _| {
-                        let weak = wl_surface.downgrade();
-                        if !surfaces_ref.contains(&weak) {
-                            output.enter(wl_surface);
-                            surfaces_ref.insert(weak);
-                        }
+                        output.enter(wl_surface);
                     },
                     |_, _, _| true,
                 );
@@ -297,11 +280,7 @@ impl LayerMap {
                         (),
                         |_, _, _| TraversalAction::DoChildren(()),
                         |wl_surface, _, _| {
-                            let weak = wl_surface.downgrade();
-                            if !surfaces_ref.contains(&weak) {
-                                output.enter(wl_surface);
-                                surfaces_ref.insert(weak);
-                            }
+                            output.enter(wl_surface);
                         },
                         |_, _, _| true,
                     )
@@ -462,7 +441,6 @@ impl LayerMap {
             self.layers.retain(|layer| layer.alive());
             self.arrange();
         }
-        self.surfaces.retain(|weak| weak.upgrade().is_ok());
     }
 
     /// Returns layers count
@@ -703,16 +681,16 @@ impl LayerSurface {
     }
 
     /// Run a closure on all surfaces in this layer (including it's popups, if [`PopupManager`] is used)
-    pub fn with_surfaces<F>(&self, processor: F)
+    pub fn with_surfaces<F>(&self, mut processor: F)
     where
-        F: FnMut(&WlSurface, &SurfaceData) + Copy,
+        F: FnMut(&WlSurface, &SurfaceData),
     {
         let surface = self.0.surface.wl_surface();
 
-        with_surfaces_surface_tree(surface, processor);
+        with_surfaces_surface_tree(surface, &mut processor);
         for (popup, _) in PopupManager::popups_for_surface(surface) {
             let surface = popup.wl_surface();
-            with_surfaces_surface_tree(surface, processor);
+            with_surfaces_surface_tree(surface, &mut processor);
         }
     }
 
@@ -755,6 +733,11 @@ impl<D: SeatHandler + 'static> PointerTarget<D> for LayerSurface {
     fn axis(&self, seat: &Seat<D>, data: &mut D, frame: AxisFrame) {
         if let Some(surface) = self.0.focused_surface.lock().unwrap().as_ref() {
             PointerTarget::<D>::axis(surface, seat, data, frame)
+        }
+    }
+    fn frame(&self, seat: &Seat<D>, data: &mut D) {
+        if let Some(surface) = self.0.focused_surface.lock().unwrap().as_ref() {
+            PointerTarget::<D>::frame(surface, seat, data)
         }
     }
     fn leave(&self, seat: &Seat<D>, data: &mut D, serial: Serial, time: u32) {

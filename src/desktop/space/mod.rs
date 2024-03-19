@@ -26,7 +26,7 @@ mod output;
 mod utils;
 
 #[cfg(feature = "wayland_frontend")]
-mod wayland;
+pub(crate) mod wayland;
 
 pub use self::element::*;
 use self::output::*;
@@ -325,6 +325,7 @@ impl<E: SpaceElement + PartialEq> Space<E> {
     ///
     /// Needs to be called periodically, at best before every
     /// wayland socket flush.
+    #[profiling::function]
     pub fn refresh(&mut self) {
         self.elements.retain(|e| e.alive());
 

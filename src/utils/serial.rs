@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 ///
 /// Is is also used internally by some parts of Smithay.
 pub static SERIAL_COUNTER: SerialCounter = SerialCounter {
-    serial: AtomicU32::new(0),
+    serial: AtomicU32::new(1),
 };
 
 /// A serial type, whose comparison takes into account the wrapping-around behavior of the
@@ -48,6 +48,13 @@ impl From<Serial> for u32 {
     }
 }
 
+impl Serial {
+    /// Checks if a serial was generated after or is equal to another given serial
+    pub fn is_no_older_than(&self, other: &Serial) -> bool {
+        other <= self
+    }
+}
+
 /// A counter for generating serials, for use in the client protocol
 ///
 /// A global instance of this counter is available as the `SERIAL_COUNTER`
@@ -64,6 +71,9 @@ pub struct SerialCounter {
 impl SerialCounter {
     /// Retrieve the next serial from the counter
     pub fn next_serial(&self) -> Serial {
+        let _ = self
+            .serial
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::SeqCst);
         Serial(self.serial.fetch_add(1, Ordering::AcqRel))
     }
 }
@@ -114,7 +124,7 @@ mod tests {
         let serial2 = counter.next_serial();
 
         assert!(serial1 == u32::MAX.into());
-        assert!(serial2 == 0.into());
+        assert!(serial2 == 1.into());
 
         assert!(serial1 < serial2);
     }

@@ -24,6 +24,7 @@
 //! use smithay::delegate_output;
 //! use smithay::output::{Output, PhysicalProperties, Scale, Mode, Subpixel};
 //! use smithay::utils::Transform;
+//! use smithay::wayland::output::OutputHandler;
 //!
 //! # struct State;
 //! # let mut display = wayland_server::Display::<State>::new().unwrap();
@@ -55,11 +56,13 @@
 //! output.add_mode(Mode { size: (800, 600).into(), refresh: 60000 });
 //! output.add_mode(Mode { size: (1024, 768).into(), refresh: 60000 });
 //!
+//! impl OutputHandler for State {}
 //! delegate_output!(State);
 //! ```
 
 mod handlers;
 pub(crate) mod xdg;
+
 use crate::output::{Inner, Mode, Output, OutputData, Scale, Subpixel};
 
 use tracing::info;
@@ -87,6 +90,12 @@ pub struct OutputManagerState {
 #[derive(Debug)]
 pub struct WlOutputData {
     inner: OutputData,
+}
+
+/// Events initiated by the clients interacting with outputs
+pub trait OutputHandler {
+    /// A client bound a new `wl_output` instance.
+    fn output_bound(&mut self, _output: Output, _wl_output: WlOutput) {}
 }
 
 impl OutputManagerState {
@@ -264,8 +273,16 @@ impl Output {
             .and_then(|handle| handle.upgrade())
             .and_then(|handle| handle.get_client(surface.id()).ok());
         if let Some(client) = client {
-            for output in self.client_outputs_internal(client) {
-                surface.enter(&output);
+            let weak = surface.downgrade();
+            let mut inner = self.inner.0.lock().unwrap();
+            inner.surfaces.retain(|s| s.upgrade().is_ok());
+            if !inner.surfaces.contains(&weak) {
+                inner.surfaces.insert(weak);
+                drop(inner);
+
+                for output in self.client_outputs_internal(client) {
+                    surface.enter(&output);
+                }
             }
         }
     }
@@ -283,8 +300,16 @@ impl Output {
             .and_then(|handle| handle.upgrade())
             .and_then(|handle| handle.get_client(surface.id()).ok());
         if let Some(client) = client {
-            for output in self.client_outputs_internal(client) {
-                surface.leave(&output);
+            let weak = surface.downgrade();
+            let mut inner = self.inner.0.lock().unwrap();
+            inner.surfaces.retain(|s| s.upgrade().is_ok());
+            if inner.surfaces.contains(&weak) {
+                inner.surfaces.remove(&weak);
+                drop(inner);
+
+                for output in self.client_outputs_internal(client) {
+                    surface.leave(&output);
+                }
             }
         }
     }

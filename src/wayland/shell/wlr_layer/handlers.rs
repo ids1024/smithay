@@ -1,4 +1,4 @@
-use std::{convert::TryFrom, sync::Mutex};
+use std::sync::Mutex;
 
 use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::{self, ZwlrLayerShellV1};
 use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_surface_v1;
@@ -15,7 +15,7 @@ use crate::wayland::{compositor, shell::wlr_layer::Layer};
 
 use super::{
     Anchor, KeyboardInteractivity, LayerSurfaceAttributes, LayerSurfaceCachedState, LayerSurfaceData,
-    Margins, WlrLayerShellHandler, WlrLayerShellState,
+    Margins, WlrLayerShellGlobalData, WlrLayerShellHandler, WlrLayerShellState,
 };
 
 use super::LAYER_SURFACE_ROLE;
@@ -24,9 +24,9 @@ use super::LAYER_SURFACE_ROLE;
  * layer_shell
  */
 
-impl<D> GlobalDispatch<ZwlrLayerShellV1, (), D> for WlrLayerShellState
+impl<D> GlobalDispatch<ZwlrLayerShellV1, WlrLayerShellGlobalData, D> for WlrLayerShellState
 where
-    D: GlobalDispatch<ZwlrLayerShellV1, ()>,
+    D: GlobalDispatch<ZwlrLayerShellV1, WlrLayerShellGlobalData>,
     D: Dispatch<ZwlrLayerShellV1, ()>,
     D: Dispatch<ZwlrLayerSurfaceV1, WlrLayerSurfaceUserData>,
     D: WlrLayerShellHandler,
@@ -37,10 +37,14 @@ where
         _handle: &DisplayHandle,
         _client: &Client,
         resource: wayland_server::New<ZwlrLayerShellV1>,
-        _global_data: &(),
+        _global_data: &WlrLayerShellGlobalData,
         data_init: &mut DataInit<'_, D>,
     ) {
         data_init.init(resource, ());
+    }
+
+    fn can_view(client: Client, global_data: &WlrLayerShellGlobalData) -> bool {
+        (global_data.filter)(&client)
     }
 }
 
@@ -324,7 +328,7 @@ where
     fn destroyed(
         state: &mut D,
         _client_id: wayland_server::backend::ClientId,
-        object_id: wayland_server::backend::ObjectId,
+        layer_surface: &ZwlrLayerSurfaceV1,
         data: &WlrLayerSurfaceUserData,
     ) {
         data.alive_tracker.destroy_notify();
@@ -333,7 +337,7 @@ where
         let mut layers = data.shell_data.known_layers.lock().unwrap();
         if let Some(index) = layers
             .iter()
-            .position(|layer| layer.shell_surface.id() == object_id)
+            .position(|layer| layer.shell_surface.id() == layer_surface.id())
         {
             let layer = layers.remove(index);
             drop(layers);

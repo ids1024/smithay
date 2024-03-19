@@ -30,7 +30,7 @@
 //!
 //! Then, the [`seat`] module contains logic related to input handling. These helpers are used
 //! to forward input (such as pointer action or keystrokes) to clients, and manage the input
-//! focus of clients. Tightly coupled with it is the [`data_device`] module, which handles
+//! focus of clients. Tightly coupled with it is the [`selection`] module, which handles
 //! cross-client interactions such as accessing the clipboard, or drag'n'drop actions.
 //!
 //! The [`shm`] module provides the necessary logic for client to provide buffers defining the
@@ -48,19 +48,24 @@
 pub mod buffer;
 pub mod compositor;
 pub mod content_type;
-pub mod data_device;
+pub mod cursor_shape;
 pub mod dmabuf;
+#[cfg(feature = "backend_drm")]
+pub mod drm_lease;
 pub mod fractional_scale;
 pub mod idle_inhibit;
+pub mod idle_notify;
 pub mod input_method;
 pub mod keyboard_shortcuts_inhibit;
 pub mod output;
+pub mod pointer_constraints;
 pub mod pointer_gestures;
 pub mod presentation;
-pub mod primary_selection;
 pub mod relative_pointer;
 pub mod seat;
 pub mod security_context;
+pub mod selection;
+pub mod session_lock;
 pub mod shell;
 pub mod shm;
 pub mod socket;

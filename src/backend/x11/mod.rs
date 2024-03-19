@@ -3,11 +3,7 @@
 //! This backend provides the appropriate backend implementations to run a Wayland compositor as an
 //! X11 client.
 //!
-//! The backend is initialized using [`X11Backend::new`](self::X11Backend::new). The function will
-//! return two objects:
-//!
-//! - an [`X11Backend`], which you will insert into an [`EventLoop`](calloop::EventLoop) to process events from the backend.
-//! - an [`X11Surface`], which represents a surface that buffers are presented to for display.
+//! The backend is initialized using [`X11Backend::new`](self::X11Backend::new).
 //!
 //! ## Example usage
 //!
@@ -24,7 +20,7 @@
 //! fn init_x11_backend(
 //!    handle: calloop::LoopHandle<CompositorState>,
 //! ) -> Result<(), Box<dyn Error>> {
-//!     // Create the backend, also yielding a surface that may be used to render to the window.
+//!     // Create the backend
 //!     let backend = X11Backend::new()?;
 //!
 //!     // Get a handle from the backend to interface with the X server
@@ -61,7 +57,7 @@
 //!
 //! ## EGL
 //!
-//! When using [`EGL`](crate::backend::egl), an [`X11Surface`] may be used to create an [`EGLDisplay`](crate::backend::egl::EGLDisplay).
+//! When using [`EGL`](crate::backend::egl), an [`X11Surface`] may be used to create an [`EGLDisplay`].
 
 /*
 A note for future contributors and maintainers:
@@ -92,14 +88,17 @@ use crate::{
 };
 use calloop::{EventSource, Poll, PostAction, Readiness, Token, TokenFactory};
 use drm_fourcc::{DrmFourcc, DrmModifier};
+/*
 use nix::{
     fcntl::{self, OFlag},
     sys::stat::Mode,
 };
+*/
+use rustix::fs::{Mode, OFlags};
 use std::{
     collections::HashMap,
     io,
-    os::unix::io::{FromRawFd, OwnedFd},
+    os::unix::io::OwnedFd,
     sync::{
         atomic::{AtomicU32, Ordering},
         mpsc, Arc, Mutex, Weak,
@@ -134,6 +133,9 @@ pub enum X11Event {
         /// XID of the window
         window_id: u32,
     },
+
+    /// The focus state of the window changed.
+    Focus(bool),
 
     /// An input event occurred.
     Input(InputEvent<X11Input>),
@@ -643,11 +645,19 @@ impl X11Inner {
             }
         }
 
-        use self::X11Event::Input;
+        use self::X11Event::{Focus, Input};
 
         // If X11 is deadlocking somewhere here, make sure you drop your mutex guards.
 
         match event {
+            x11::Event::FocusIn(_focus_in) => {
+                callback(Focus(true), &mut ());
+            }
+
+            x11::Event::FocusOut(_focus_out) => {
+                callback(Focus(false), &mut ());
+            }
+
             x11::Event::ButtonPress(button_press) => {
                 if let Some(window) = X11Inner::window_ref_from_id(inner, &button_press.event) {
                     // X11 decided to associate scroll wheel with a button, 4, 5, 6 and 7 for
@@ -926,7 +936,7 @@ impl X11Inner {
 }
 
 fn egl_init(_: &X11Inner) -> Result<(DrmNode, OwnedFd), EGLInitError> {
-    let display = EGLDisplay::new(X11DefaultDisplay)?;
+    let display = unsafe { EGLDisplay::new(X11DefaultDisplay)? };
     let device = EGLDevice::device_for_display(&display)?;
     let path = path_to_type(device.drm_device_path()?, NodeType::Render)?;
     let node = DrmNode::from_path(&path)
@@ -935,10 +945,10 @@ fn egl_init(_: &X11Inner) -> Result<(DrmNode, OwnedFd), EGLInitError> {
             _ => unreachable!(),
         })
         .map_err(EGLInitError::IO)?;
-    let fd = fcntl::open(&path, OFlag::O_RDWR | OFlag::O_CLOEXEC, Mode::empty())
+    let fd = rustix::fs::open(&path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
         .map_err(Into::<io::Error>::into)
         .map_err(EGLInitError::IO)?;
-    Ok((node, unsafe { OwnedFd::from_raw_fd(fd) }))
+    Ok((node, fd))
 }
 
 fn dri3_init(x11: &X11Inner) -> Result<(DrmNode, OwnedFd), X11Error> {
@@ -964,17 +974,18 @@ fn dri3_init(x11: &X11Inner) -> Result<(DrmNode, OwnedFd), X11Error> {
             });
         }
     };
+    let device_fd = dri3.device_fd;
 
-    let dri_node = DrmNode::from_file(&dri3.device_fd).map_err(Into::<AllocateBuffersError>::into)?;
+    let dri_node = DrmNode::from_file(&device_fd).map_err(Into::<AllocateBuffersError>::into)?;
     if dri_node.ty() != NodeType::Render {
         // Try to get the render node.
         match dri_node.node_with_type(NodeType::Render) {
             Some(Ok(node)) => {
                 match node
                     .dev_path()
-                    .map(|path| fcntl::open(&path, OFlag::O_RDWR | OFlag::O_CLOEXEC, Mode::empty()))
+                    .map(|path| rustix::fs::open(path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty()))
                 {
-                    Some(Ok(fd)) => return Ok((node, unsafe { OwnedFd::from_raw_fd(fd) })),
+                    Some(Ok(fd)) => return Ok((node, fd)),
                     Some(Err(err)) => {
                         warn!("Could not create render node from existing DRM node ({:?}): {}, falling back to primary node", dri_node.dev_path().as_ref().map(|x| x.display()), err);
                     }
@@ -995,15 +1006,11 @@ fn dri3_init(x11: &X11Inner) -> Result<(DrmNode, OwnedFd), X11Error> {
         };
     }
 
-    let fd = dri3.device_fd.into_raw_fd();
-    let fd_flags = fcntl::fcntl(fd, fcntl::F_GETFD).map_err(AllocateBuffersError::from)?;
+    let fd_flags = rustix::io::fcntl_getfd(&device_fd).map_err(AllocateBuffersError::from)?;
 
     // Enable the close-on-exec flag.
-    fcntl::fcntl(
-        fd,
-        fcntl::F_SETFD(fcntl::FdFlag::from_bits_truncate(fd_flags) | fcntl::FdFlag::FD_CLOEXEC),
-    )
-    .map_err(AllocateBuffersError::from)?;
+    rustix::io::fcntl_setfd(&device_fd, fd_flags | rustix::io::FdFlags::CLOEXEC)
+        .map_err(AllocateBuffersError::from)?;
 
-    Ok((dri_node, unsafe { OwnedFd::from_raw_fd(fd) }))
+    Ok((dri_node, device_fd))
 }

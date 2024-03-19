@@ -292,28 +292,20 @@ where
     fn destroyed(
         state: &mut D,
         _client_id: wayland_server::backend::ClientId,
-        object_id: wayland_server::backend::ObjectId,
+        surface: &WlSurface,
         data: &SurfaceUserData,
     ) {
-        let surface = state
-            .compositor_state()
-            .surfaces
-            .iter()
-            .find(|surface| surface.id() == object_id)
-            .cloned()
-            .unwrap();
-
         // We let the destruction hooks run first and then tell the compositor handler the surface was
         // destroyed.
         data.alive_tracker.destroy_notify();
-        state.destroyed(&surface);
+        state.destroyed(surface);
 
         // Remove the surface after the callback is invoked.
         state
             .compositor_state()
             .surfaces
-            .retain(|surface| surface.id() != object_id);
-        PrivateSurfaceData::cleanup(state, data, object_id);
+            .retain(|s| s.id() != surface.id());
+        PrivateSurfaceData::cleanup(state, data, surface.id());
     }
 }
 
@@ -398,7 +390,7 @@ where
     D: 'static,
 {
     fn request(
-        _state: &mut D,
+        state: &mut D,
         _client: &wayland_server::Client,
         subcompositor: &WlSubcompositor,
         request: wl_subcompositor::Request,
@@ -424,6 +416,8 @@ where
                 super::with_states(&surface, |states| {
                     states.data_map.insert_if_missing_threadsafe(SubsurfaceState::new)
                 });
+
+                state.new_subsurface(&surface, &parent);
             }
             wl_subcompositor::Request::Destroy => {}
             _ => unreachable!(),
@@ -569,7 +563,7 @@ where
     fn destroyed(
         _state: &mut D,
         _client_id: wayland_server::backend::ClientId,
-        _object_id: wayland_server::backend::ObjectId,
+        _object: &WlSubsurface,
         data: &SubsurfaceUserData,
     ) {
         PrivateSurfaceData::unset_parent(&data.surface);

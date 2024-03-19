@@ -43,7 +43,7 @@ pub struct GlowRenderer {
 }
 
 #[derive(Debug)]
-/// [`Frame`](super::Frame) implementation of a [`GlowRenderer`].
+/// [`Frame`] implementation of a [`GlowRenderer`].
 ///
 /// Leaking the frame will cause the same problems as leaking a [`GlesFrame`].
 pub struct GlowFrame<'a> {
@@ -61,7 +61,7 @@ impl GlowRenderer {
         GlesRenderer::supported_capabilities(context)
     }
 
-    /// Creates a new OpenGL ES 2 + Glow renderer from a given [`EGLContext`](crate::backend::egl::EGLContext)
+    /// Creates a new OpenGL ES 2 + Glow renderer from a given [`EGLContext`]
     /// with all [`supported capabilities`](Self::supported_capabilities).
     ///
     /// # Safety
@@ -74,7 +74,7 @@ impl GlowRenderer {
         Self::with_capabilities(context, supported_capabilities)
     }
 
-    /// Creates a new OpenGL ES 2 + Glow renderer from a given [`EGLContext`](crate::backend::egl::EGLContext)
+    /// Creates a new OpenGL ES 2 + Glow renderer from a given [`EGLContext`]
     /// with the specified [`Capabilities`](Capability). If a requested [`Capability`] is not supported an
     /// error will be returned.
     ///
@@ -424,6 +424,9 @@ impl ImportDma for GlowRenderer {
     fn dmabuf_formats(&self) -> Box<dyn Iterator<Item = Format>> {
         self.gl.dmabuf_formats()
     }
+    fn has_dmabuf_format(&self, format: Format) -> bool {
+        self.gl.has_dmabuf_format(format)
+    }
 }
 
 #[cfg(feature = "wayland_frontend")]
@@ -449,6 +452,10 @@ impl ExportMem for GlowRenderer {
         format: Fourcc,
     ) -> Result<Self::TextureMapping, Self::Error> {
         self.gl.copy_texture(texture, region, format)
+    }
+
+    fn can_read_texture(&mut self, texture: &Self::TextureId) -> Result<bool, Self::Error> {
+        self.gl.can_read_texture(texture)
     }
 
     #[profiling::function]

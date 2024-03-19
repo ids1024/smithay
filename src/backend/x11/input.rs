@@ -3,9 +3,9 @@
 use super::{window_inner::WindowInner, Window, WindowTemporary};
 use crate::{
     backend::input::{
-        self, AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, InputBackend,
-        KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionAbsoluteEvent,
-        UnusedEvent,
+        self, AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState, Device,
+        DeviceCapability, InputBackend, KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+        PointerMotionAbsoluteEvent, UnusedEvent,
     },
     utils::{Logical, Size},
 };
@@ -120,9 +120,9 @@ impl PointerAxisEvent<X11Input> for X11MouseWheelEvent {
         None
     }
 
-    fn amount_discrete(&self, axis: Axis) -> Option<f64> {
+    fn amount_v120(&self, axis: Axis) -> Option<f64> {
         if self.axis == axis {
-            Some(self.amount)
+            Some(self.amount * 120.)
         } else {
             Some(0.0)
         }
@@ -131,6 +131,10 @@ impl PointerAxisEvent<X11Input> for X11MouseWheelEvent {
     fn source(&self) -> AxisSource {
         // X11 seems to act within the scope of individual rachets of a scroll wheel.
         AxisSource::Wheel
+    }
+
+    fn relative_direction(&self, _axis: Axis) -> AxisRelativeDirection {
+        AxisRelativeDirection::Identical
     }
 }
 
@@ -248,6 +252,8 @@ impl InputBackend for X11Input {
     type TabletToolProximityEvent = UnusedEvent;
     type TabletToolTipEvent = UnusedEvent;
     type TabletToolButtonEvent = UnusedEvent;
+
+    type SwitchToggleEvent = UnusedEvent;
 
     type SpecialEvent = UnusedEvent;
 }

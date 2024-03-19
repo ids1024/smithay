@@ -104,6 +104,13 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for FocusTarge
             FocusTarget::Popup(p) => PointerTarget::axis(p.wl_surface(), seat, data, frame),
         }
     }
+    fn frame(&self, seat: &Seat<AnvilState<BackendData>>, data: &mut AnvilState<BackendData>) {
+        match self {
+            FocusTarget::Window(w) => PointerTarget::frame(w, seat, data),
+            FocusTarget::LayerSurface(l) => PointerTarget::frame(l, seat, data),
+            FocusTarget::Popup(p) => PointerTarget::frame(p.wl_surface(), seat, data),
+        }
+    }
     fn leave(
         &self,
         seat: &Seat<AnvilState<BackendData>>,
@@ -283,9 +290,7 @@ impl WaylandFocus for FocusTarget {
     }
     fn same_client_as(&self, object_id: &ObjectId) -> bool {
         match self {
-            FocusTarget::Window(WindowElement::Wayland(w)) => w.same_client_as(object_id),
-            #[cfg(feature = "xwayland")]
-            FocusTarget::Window(WindowElement::X11(w)) => w.same_client_as(object_id),
+            FocusTarget::Window(w) => w.0.same_client_as(object_id),
             FocusTarget::LayerSurface(l) => l.wl_surface().id().same_client_as(object_id),
             FocusTarget::Popup(p) => p.wl_surface().id().same_client_as(object_id),
         }

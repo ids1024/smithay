@@ -5,11 +5,12 @@ use smithay::{
     backend::{
         allocator::{
             dmabuf::{AnyError, Dmabuf, DmabufAllocator},
+            dumb::DumbAllocator,
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
             vulkan::{ImageUsageFlags, VulkanAllocator},
             Allocator, Fourcc, Modifier,
         },
-        drm::{DrmDevice, DrmDeviceFd, DrmNode},
+        drm::{DrmDeviceFd, DrmNode},
         egl::{EGLContext, EGLDevice, EGLDisplay},
         renderer::{
             gles::{GlesRenderbuffer, GlesRenderer},
@@ -126,7 +127,7 @@ fn format_test(render: Vec<String>, sample: Vec<String>) {
                         || device.render_device_path().ok().as_ref() == Some(&path)
                 })
                 .expect("Unable to find egl device");
-            let display = EGLDisplay::new(device).expect("Failed to create EGL display");
+            let display = unsafe { EGLDisplay::new(device).expect("Failed to create EGL display") };
             display.dmabuf_render_formats().clone()
         })
         .chain(sample.iter().map(|path| {
@@ -138,7 +139,7 @@ fn format_test(render: Vec<String>, sample: Vec<String>) {
                         || device.render_device_path().ok().as_ref() == Some(&path)
                 })
                 .expect("Unable to find egl device");
-            let display = EGLDisplay::new(device).expect("Failed to create EGL display");
+            let display = unsafe { EGLDisplay::new(device).expect("Failed to create EGL display") };
             display.dmabuf_texture_formats().clone()
         }))
         .fold(None, |set, formats| match set {
@@ -159,7 +160,7 @@ fn open_device(path: &str) -> DrmDeviceFd {
     let file = File::options()
         .read(true)
         .write(true)
-        .open(&path)
+        .open(path)
         .expect("Failed to open device node");
     DrmDeviceFd::new(DeviceFd::from(Into::<OwnedFd>::into(file)))
 }
@@ -173,9 +174,8 @@ fn buffer_test(args: TestArgs) {
     let mut allocator = match args.allocator {
         AllocatorType::DumbBuffer => {
             let fd = open_device(&path);
-            Box::new(DmabufAllocator(
-                DrmDevice::new(fd, false).expect("Failed to init drm device").0,
-            )) as Box<dyn Allocator<Buffer = Dmabuf, Error = AnyError>>
+            let dumb_allocator = DumbAllocator::new(fd);
+            Box::new(DmabufAllocator(dumb_allocator)) as Box<dyn Allocator<Buffer = Dmabuf, Error = AnyError>>
         }
         AllocatorType::Gbm => {
             let fd = open_device(&path);
@@ -222,7 +222,7 @@ fn buffer_test(args: TestArgs) {
                         || device.render_device_path().ok().as_ref() == Some(&path)
                 })
                 .expect("Unable to find egl device");
-            let display = EGLDisplay::new(device).expect("Failed to create EGL display");
+            let display = unsafe { EGLDisplay::new(device).expect("Failed to create EGL display") };
 
             let context = EGLContext::new(&display).expect("Failed to create EGL context");
             let mut renderer = unsafe { GlesRenderer::new(context).expect("Failed to init GL ES renderer") };
@@ -248,7 +248,7 @@ fn buffer_test(args: TestArgs) {
                         || device.render_device_path().ok().as_ref() == Some(&path)
                 })
                 .expect("Unable to find egl device");
-            let display = EGLDisplay::new(device).expect("Failed to create EGL display");
+            let display = unsafe { EGLDisplay::new(device).expect("Failed to create EGL display") };
 
             display
                 .create_image_from_dmabuf(&buffer)
@@ -262,7 +262,7 @@ fn buffer_test(args: TestArgs) {
                         || device.render_device_path().ok().as_ref() == Some(&path)
                 })
                 .expect("Unable to find egl device");
-            let display = EGLDisplay::new(device).expect("Failed to create EGL display");
+            let display = unsafe { EGLDisplay::new(device).expect("Failed to create EGL display") };
 
             let context = EGLContext::new(&display).expect("Failed to create EGL context");
             let mut renderer = unsafe { GlesRenderer::new(context).expect("Failed to init GL ES renderer") };

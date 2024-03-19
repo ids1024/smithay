@@ -5,8 +5,7 @@ use std::sync::{
 
 use wayland_protocols::xdg::activation::v1::server::{xdg_activation_token_v1, xdg_activation_v1};
 use wayland_server::{
-    backend::{ClientId, ObjectId},
-    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
+    backend::ClientId, Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 };
 
 use super::{
@@ -52,10 +51,7 @@ where
 
                 let activation_state = state.activation_state();
 
-                if let Some(token_data) = activation_state.pending_tokens.remove(&token) {
-                    activation_state
-                        .activation_requests
-                        .insert(token.clone(), (token_data.clone(), surface.clone()));
+                if let Some(token_data) = activation_state.known_tokens.get(&token).cloned() {
                     state.request_activation(token, token_data, surface);
                 }
             }
@@ -91,7 +87,7 @@ where
 {
     fn request(
         state: &mut D,
-        _: &Client,
+        client: &Client,
         token: &xdg_activation_token_v1::XdgActivationTokenV1,
         request: xdg_activation_token_v1::Request,
         data: &ActivationTokenData,
@@ -150,17 +146,22 @@ where
                     let mut guard = data.build.lock().unwrap();
 
                     XdgActivationTokenData::new(
+                        Some(client.id()),
                         guard.serial.take(),
                         guard.app_id.take(),
                         guard.surface.take(),
                     )
                 };
 
+                let valid = state.token_created(activation_token.clone(), token_data.clone());
+
                 *data.token.lock().unwrap() = Some(activation_token.clone());
-                state
-                    .activation_state()
-                    .pending_tokens
-                    .insert(activation_token.clone(), token_data);
+                if valid {
+                    state
+                        .activation_state()
+                        .known_tokens
+                        .insert(activation_token.clone(), token_data);
+                }
                 token.done(activation_token.to_string());
             }
 
@@ -170,17 +171,11 @@ where
         }
     }
 
-    fn destroyed(state: &mut D, _: ClientId, _: ObjectId, data: &ActivationTokenData) {
-        let guard = data.token.lock().unwrap();
-
-        if let Some(token) = &*guard {
-            let activation_state = state.activation_state();
-
-            activation_state.pending_tokens.remove(token);
-
-            if let Some((token_data, surface)) = activation_state.activation_requests.remove(token) {
-                state.destroy_activation(token.clone(), token_data, surface);
-            }
-        }
+    fn destroyed(
+        _: &mut D,
+        _: ClientId,
+        _: &xdg_activation_token_v1::XdgActivationTokenV1,
+        _: &ActivationTokenData,
+    ) {
     }
 }

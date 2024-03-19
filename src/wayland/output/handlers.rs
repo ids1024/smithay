@@ -8,7 +8,7 @@ use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 };
 
-use super::{xdg::XdgOutput, Output, OutputManagerState, OutputUserData, WlOutputData};
+use super::{xdg::XdgOutput, Output, OutputHandler, OutputManagerState, OutputUserData, WlOutputData};
 
 /*
  * Wl Output
@@ -18,12 +18,13 @@ impl<D> GlobalDispatch<WlOutput, WlOutputData, D> for OutputManagerState
 where
     D: GlobalDispatch<WlOutput, WlOutputData>,
     D: Dispatch<WlOutput, OutputUserData>,
+    D: OutputHandler,
     D: 'static,
 {
     fn bind(
-        _state: &mut D,
+        state: &mut D,
         _dh: &DisplayHandle,
-        _client: &Client,
+        client: &Client,
         resource: New<WlOutput>,
         global_data: &WlOutputData,
         data_init: &mut DataInit<'_, D>,
@@ -75,7 +76,22 @@ where
             output.done();
         }
 
-        inner.instances.push(output);
+        // Send enter for surfaces already on this output.
+        for surface in &inner.surfaces {
+            if let Ok(surface) = surface.upgrade() {
+                if surface.client().as_ref() == Some(client) {
+                    surface.enter(&output);
+                }
+            }
+        }
+
+        inner.instances.push(output.clone());
+
+        drop(inner);
+        let o = Output {
+            inner: global_data.inner.clone(),
+        };
+        state.output_bound(o, output);
     }
 }
 
@@ -97,7 +113,7 @@ where
     fn destroyed(
         _state: &mut D,
         _client_id: wayland_server::backend::ClientId,
-        object_id: wayland_server::backend::ObjectId,
+        output: &WlOutput,
         data: &OutputUserData,
     ) {
         data.global_data
@@ -105,7 +121,7 @@ where
             .lock()
             .unwrap()
             .instances
-            .retain(|o| o.id() != object_id);
+            .retain(|o| o.id() != output.id());
     }
 }
 
@@ -195,7 +211,7 @@ where
     fn destroyed(
         _state: &mut D,
         _client_id: wayland_server::backend::ClientId,
-        object_id: wayland_server::backend::ObjectId,
+        xdg_output: &ZxdgOutputV1,
         data: &XdgOutputUserData,
     ) {
         data.xdg_output
@@ -203,6 +219,6 @@ where
             .lock()
             .unwrap()
             .instances
-            .retain(|o| o.id() != object_id);
+            .retain(|o| o.id() != xdg_output.id());
     }
 }

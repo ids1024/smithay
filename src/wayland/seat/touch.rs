@@ -4,7 +4,7 @@ use std::{
 };
 
 use wayland_server::{
-    backend::{ClientId, ObjectId},
+    backend::ClientId,
     protocol::wl_touch::{self, WlTouch},
     Dispatch, DisplayHandle, Resource,
 };
@@ -44,7 +44,7 @@ impl TouchHandle {
     ///
     /// The `position` parameter is in surface-local coordinates.
     pub fn down(
-        &mut self,
+        &self,
         serial: Serial,
         time: u32,
         surface: &WlSurface,
@@ -204,14 +204,14 @@ where
     ) {
     }
 
-    fn destroyed(_state: &mut D, _client_id: ClientId, object_id: ObjectId, data: &TouchUserData) {
+    fn destroyed(_state: &mut D, _client_id: ClientId, touch: &WlTouch, data: &TouchUserData) {
         if let Some(ref handle) = data.handle {
             handle
                 .inner
                 .lock()
                 .unwrap()
                 .known_handles
-                .retain(|k| k.id() != object_id)
+                .retain(|k| k.id() != touch.id())
         }
     }
 }

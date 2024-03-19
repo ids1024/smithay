@@ -8,9 +8,7 @@ use crate::{
 use wayland_protocols::xdg::shell::server::xdg_toplevel::{self, XdgToplevel};
 
 use wayland_server::{
-    backend::{ClientId, ObjectId},
-    protocol::wl_surface,
-    DataInit, Dispatch, DisplayHandle, Resource, WEnum,
+    backend::ClientId, protocol::wl_surface, DataInit, Dispatch, DisplayHandle, Resource, WEnum,
 };
 
 use super::{
@@ -53,15 +51,35 @@ where
             }
             xdg_toplevel::Request::SetTitle { title } => {
                 // Title is not double buffered, we can set it directly
-                with_surface_toplevel_role_data(toplevel, |data| {
-                    data.title = Some(title);
+                let changed = with_surface_toplevel_role_data(toplevel, |role| {
+                    if role.title.as_ref() != Some(&title) {
+                        role.title = Some(title);
+                        true
+                    } else {
+                        false
+                    }
                 });
+
+                if changed {
+                    let handle = make_toplevel_handle(toplevel);
+                    XdgShellHandler::title_changed(state, handle);
+                }
             }
             xdg_toplevel::Request::SetAppId { app_id } => {
                 // AppId is not double buffered, we can set it directly
-                with_surface_toplevel_role_data(toplevel, |role| {
-                    role.app_id = Some(app_id);
+                let changed = with_surface_toplevel_role_data(toplevel, |role| {
+                    if role.app_id.as_ref() != Some(&app_id) {
+                        role.app_id = Some(app_id);
+                        true
+                    } else {
+                        false
+                    }
                 });
+
+                if changed {
+                    let handle = make_toplevel_handle(toplevel);
+                    XdgShellHandler::app_id_changed(state, handle);
+                }
             }
             xdg_toplevel::Request::ShowWindowMenu { seat, serial, x, y } => {
                 // This has to be handled by the compositor
@@ -122,7 +140,12 @@ where
         }
     }
 
-    fn destroyed(state: &mut D, _client_id: ClientId, object_id: ObjectId, data: &XdgShellSurfaceUserData) {
+    fn destroyed(
+        state: &mut D,
+        _client_id: ClientId,
+        xdg_toplevel: &XdgToplevel,
+        data: &XdgShellSurfaceUserData,
+    ) {
         data.alive_tracker.destroy_notify();
         data.decoration.lock().unwrap().take();
 
@@ -130,7 +153,7 @@ where
             .xdg_shell_state()
             .known_toplevels
             .iter()
-            .position(|top| top.shell_surface.id() == object_id)
+            .position(|top| top.shell_surface.id() == xdg_toplevel.id())
         {
             let toplevel = state.xdg_shell_state().known_toplevels.remove(index);
             let surface = toplevel.wl_surface().clone();

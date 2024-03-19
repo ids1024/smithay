@@ -20,6 +20,8 @@ use std::{cell::RefCell, sync::Mutex, time::Duration};
 use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use wayland_server::protocol::wl_surface;
 
+pub use super::super::space::wayland::output_update;
+
 impl RendererSurfaceState {
     fn contains_point<P: Into<Point<f64, Logical>>>(&self, attrs: &SurfaceAttributes, point: P) -> bool {
         let point = point.into();
@@ -402,7 +404,7 @@ impl OutputPresentationFeedback {
     {
         let time = time.into();
         let refresh = refresh.into();
-        let clk_id = Kind::id() as u32;
+        let clk_id = Kind::ID as u32;
         if let Some(output) = self.output.upgrade() {
             for mut callback in self.callbacks.drain(..) {
                 callback.presented(&output, clk_id, time, refresh, seq, flags);

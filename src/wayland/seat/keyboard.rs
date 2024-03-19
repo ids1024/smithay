@@ -111,14 +111,14 @@ where
     ) {
     }
 
-    fn destroyed(_state: &mut D, _client_id: ClientId, object_id: ObjectId, data: &KeyboardUserData<D>) {
+    fn destroyed(_state: &mut D, _client_id: ClientId, keyboard: &WlKeyboard, data: &KeyboardUserData<D>) {
         if let Some(ref handle) = data.handle {
             handle
                 .arc
                 .known_kbds
                 .lock()
                 .unwrap()
-                .retain(|k| k.id() != object_id)
+                .retain(|k| k.id() != keyboard.id())
         }
     }
 }
@@ -144,23 +144,45 @@ fn serialize_pressed_keys(keys: Vec<u32>) -> Vec<u8> {
 }
 
 impl<D: SeatHandler + 'static> KeyboardTarget<D> for WlSurface {
-    fn enter(&self, seat: &Seat<D>, _data: &mut D, keys: Vec<KeysymHandle<'_>>, serial: Serial) {
+    fn enter(&self, seat: &Seat<D>, state: &mut D, keys: Vec<KeysymHandle<'_>>, serial: Serial) {
+        *seat.get_keyboard().unwrap().arc.last_enter.lock().unwrap() = Some(serial);
         for_each_focused_kbds(seat, self, |kbd| {
             kbd.enter(
                 serial.into(),
                 self,
-                serialize_pressed_keys(keys.iter().map(|h| h.raw_code() - 8).collect()),
+                serialize_pressed_keys(keys.iter().map(|h| h.raw_code().raw() - 8).collect()),
             )
         });
+
         let text_input = seat.text_input();
-        text_input.set_focus(Some(self), || {});
+        let input_method = seat.input_method();
+
+        if input_method.has_instance() {
+            input_method.deactivate_input_method(state, true);
+        }
+
+        // NOTE: Always set focus regardless whether the client actually has the
+        // text-input global bound due to clients doing lazy global binding.
+        text_input.set_focus(Some(self.clone()));
+
+        // Only notify on `enter` once we have an actual IME.
+        if input_method.has_instance() {
+            text_input.enter();
+        }
     }
 
-    fn leave(&self, seat: &Seat<D>, _data: &mut D, serial: Serial) {
+    fn leave(&self, seat: &Seat<D>, state: &mut D, serial: Serial) {
+        *seat.get_keyboard().unwrap().arc.last_enter.lock().unwrap() = None;
         for_each_focused_kbds(seat, self, |kbd| kbd.leave(serial.into(), self));
         let text_input = seat.text_input();
         let input_method = seat.input_method();
-        text_input.set_focus(None, || input_method.close_popup());
+
+        if input_method.has_instance() {
+            input_method.deactivate_input_method(state, true);
+            text_input.leave();
+        }
+
+        text_input.set_focus(None);
     }
 
     fn key(
@@ -173,7 +195,7 @@ impl<D: SeatHandler + 'static> KeyboardTarget<D> for WlSurface {
         time: u32,
     ) {
         for_each_focused_kbds(seat, self, |kbd| {
-            kbd.key(serial.into(), time, key.raw_code() - 8, state.into())
+            kbd.key(serial.into(), time, key.raw_code().raw() - 8, state.into())
         })
     }
 

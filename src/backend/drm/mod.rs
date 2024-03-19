@@ -9,15 +9,15 @@
 //! - [`encoder`](drm::control::encoder) encodes the data of connected crtcs into a video signal for a fixed set of connectors.
 //!     E.g. you might have an analog encoder based on a DAG for VGA ports, but another one for digital ones.
 //!     Also not every encoder might be connected to every crtc.
-//! - [`framebuffer`](drm::control::framebuffer) represents a buffer you may display, see `DrmSurface` below.
-//! - [`plane`](drm::control::plane) adds another layer on top of the crtcs, which allow us to layer multiple images on top of each other more efficiently
+//! - [`framebuffer`] represents a buffer you may display, see `DrmSurface` below.
+//! - [`plane`] adds another layer on top of the crtcs, which allow us to layer multiple images on top of each other more efficiently
 //!     then by combining the rendered images in the rendering phase, e.g. via OpenGL. Planes have to be explicitly used by the user to be useful.
 //!     Every device has at least one primary plane used to display an image to the whole crtc. Additionally cursor and overlay planes may be present.
 //!     Cursor planes are usually very restricted in size and meant to be used for hardware cursors, while overlay planes may
 //!     be used for performance reasons to display any overlay on top of the image, e.g. the top-most windows.
 //!     Overlay planes may have a bunch of weird limitation, that you cannot query, e.g. only working on round pixel coordinates.
 //!     You code should never rely on a fixed set of overlay planes, but always have a fallback solution in place.
-//! - [`crtc`](drm::control::crtc)s represent scanout engines of the device pointer to one framebuffer.
+//! - [`crtc`]s represent scanout engines of the device pointer to one framebuffer.
 //!     Their responsibility is to read the data of the framebuffer and export it into an "Encoder".
 //!     The number of crtc's represent the number of independent output devices the hardware may handle.
 //!
@@ -73,6 +73,8 @@
 #[cfg(all(feature = "wayland_frontend", feature = "backend_gbm"))]
 pub mod compositor;
 pub(crate) mod device;
+#[cfg(feature = "backend_drm")]
+pub mod dumb;
 mod error;
 #[cfg(feature = "backend_gbm")]
 pub mod gbm;
@@ -81,6 +83,7 @@ pub mod node;
 mod surface;
 
 use std::collections::HashSet;
+use std::sync::Once;
 
 use crate::utils::DevPath;
 pub use device::{
@@ -88,6 +91,7 @@ pub use device::{
     Time as DrmEventTime,
 };
 use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
+pub use error::AccessError as DrmAccessError;
 pub use error::Error as DrmError;
 pub use node::{CreateDrmNodeError, DrmNode, NodeType};
 #[cfg(feature = "backend_gbm")]
@@ -99,6 +103,15 @@ use drm::{
     DriverCapability,
 };
 use tracing::trace;
+
+use self::error::AccessError;
+
+fn warn_legacy_fb_export() {
+    static WARN_LEGACY_FB_EXPORT: Once = Once::new();
+    WARN_LEGACY_FB_EXPORT.call_once(|| {
+        tracing::warn!("using legacy fbadd");
+    });
+}
 
 /// Common framebuffer operations
 pub trait Framebuffer: AsRef<framebuffer::Handle> {
@@ -139,23 +152,29 @@ fn planes(
     let mut cursor = None;
     let mut overlay = Vec::new();
 
-    let planes = dev.plane_handles().map_err(|source| DrmError::Access {
-        errmsg: "Error loading plane handles",
-        dev: dev.dev_path(),
-        source,
+    let planes = dev.plane_handles().map_err(|source| {
+        DrmError::Access(AccessError {
+            errmsg: "Error loading plane handles",
+            dev: dev.dev_path(),
+            source,
+        })
     })?;
 
-    let resources = dev.resource_handles().map_err(|source| DrmError::Access {
-        errmsg: "Error loading resource handles",
-        dev: dev.dev_path(),
-        source,
+    let resources = dev.resource_handles().map_err(|source| {
+        DrmError::Access(AccessError {
+            errmsg: "Error loading resource handles",
+            dev: dev.dev_path(),
+            source,
+        })
     })?;
 
     for plane in planes {
-        let info = dev.get_plane(plane).map_err(|source| DrmError::Access {
-            errmsg: "Failed to get plane information",
-            dev: dev.dev_path(),
-            source,
+        let info = dev.get_plane(plane).map_err(|source| {
+            DrmError::Access(AccessError {
+                errmsg: "Failed to get plane information",
+                dev: dev.dev_path(),
+                source,
+            })
         })?;
         let filter = info.possible_crtcs();
         if resources.filter_crtcs(filter).contains(crtc) {
@@ -190,17 +209,21 @@ fn planes(
 }
 
 fn plane_type(dev: &(impl ControlDevice + DevPath), plane: plane::Handle) -> Result<PlaneType, DrmError> {
-    let props = dev.get_properties(plane).map_err(|source| DrmError::Access {
-        errmsg: "Failed to get properties of plane",
-        dev: dev.dev_path(),
-        source,
+    let props = dev.get_properties(plane).map_err(|source| {
+        DrmError::Access(AccessError {
+            errmsg: "Failed to get properties of plane",
+            dev: dev.dev_path(),
+            source,
+        })
     })?;
     let (ids, vals) = props.as_props_and_values();
     for (&id, &val) in ids.iter().zip(vals.iter()) {
-        let info = dev.get_property(id).map_err(|source| DrmError::Access {
-            errmsg: "Failed to get property info",
-            dev: dev.dev_path(),
-            source,
+        let info = dev.get_property(id).map_err(|source| {
+            DrmError::Access(AccessError {
+                errmsg: "Failed to get property info",
+                dev: dev.dev_path(),
+                source,
+            })
         })?;
         if info.name().to_str().map(|x| x == "type").unwrap_or(false) {
             return Ok(match val {
@@ -214,17 +237,21 @@ fn plane_type(dev: &(impl ControlDevice + DevPath), plane: plane::Handle) -> Res
 }
 
 fn plane_zpos(dev: &(impl ControlDevice + DevPath), plane: plane::Handle) -> Result<Option<i32>, DrmError> {
-    let props = dev.get_properties(plane).map_err(|source| DrmError::Access {
-        errmsg: "Failed to get properties of plane",
-        dev: dev.dev_path(),
-        source,
+    let props = dev.get_properties(plane).map_err(|source| {
+        DrmError::Access(AccessError {
+            errmsg: "Failed to get properties of plane",
+            dev: dev.dev_path(),
+            source,
+        })
     })?;
     let (ids, vals) = props.as_props_and_values();
     for (&id, &val) in ids.iter().zip(vals.iter()) {
-        let info = dev.get_property(id).map_err(|source| DrmError::Access {
-            errmsg: "Failed to get property info",
-            dev: dev.dev_path(),
-            source,
+        let info = dev.get_property(id).map_err(|source| {
+            DrmError::Access(AccessError {
+                errmsg: "Failed to get property info",
+                dev: dev.dev_path(),
+                source,
+            })
         })?;
         if info.name().to_str().map(|x| x == "zpos").unwrap_or(false) {
             let plane_zpos = match info.value_type().convert_value(val) {
@@ -246,10 +273,12 @@ fn plane_formats(
     plane: plane::Handle,
 ) -> Result<HashSet<DrmFormat>, DrmError> {
     // get plane formats
-    let plane_info = dev.get_plane(plane).map_err(|source| DrmError::Access {
-        errmsg: "Error loading plane info",
-        dev: dev.dev_path(),
-        source,
+    let plane_info = dev.get_plane(plane).map_err(|source| {
+        DrmError::Access(AccessError {
+            errmsg: "Error loading plane info",
+            dev: dev.dev_path(),
+            source,
+        })
     })?;
     let mut formats = HashSet::new();
     for code in plane_info
@@ -264,10 +293,12 @@ fn plane_formats(
     }
 
     if let Ok(1) = dev.get_driver_capability(DriverCapability::AddFB2Modifiers) {
-        let set = dev.get_properties(plane).map_err(|source| DrmError::Access {
-            errmsg: "Failed to query properties",
-            dev: dev.dev_path(),
-            source,
+        let set = dev.get_properties(plane).map_err(|source| {
+            DrmError::Access(AccessError {
+                errmsg: "Failed to query properties",
+                dev: dev.dev_path(),
+                source,
+            })
         })?;
         let (handles, _) = set.as_props_and_values();
         // for every handle ...
@@ -286,10 +317,12 @@ fn plane_formats(
             })
             .copied();
         if let Some(prop) = prop {
-            let prop_info = dev.get_property(prop).map_err(|source| DrmError::Access {
-                errmsg: "Failed to query property",
-                dev: dev.dev_path(),
-                source,
+            let prop_info = dev.get_property(prop).map_err(|source| {
+                DrmError::Access(AccessError {
+                    errmsg: "Failed to query property",
+                    dev: dev.dev_path(),
+                    source,
+                })
             })?;
             let (handles, raw_values) = set.as_props_and_values();
             let raw_value = raw_values[handles
@@ -299,10 +332,12 @@ fn plane_formats(
                 .unwrap()];
             if let drm::control::property::Value::Blob(blob) = prop_info.value_type().convert_value(raw_value)
             {
-                let data = dev.get_property_blob(blob).map_err(|source| DrmError::Access {
-                    errmsg: "Failed to query property blob data",
-                    dev: dev.dev_path(),
-                    source,
+                let data = dev.get_property_blob(blob).map_err(|source| {
+                    DrmError::Access(AccessError {
+                        errmsg: "Failed to query property blob data",
+                        dev: dev.dev_path(),
+                        source,
+                    })
                 })?;
                 // be careful here, we have no idea about the alignment inside the blob, so always copy using `read_unaligned`,
                 // although slice::from_raw_parts would be so much nicer to iterate and to read.
@@ -375,17 +410,21 @@ fn plane_has_property(
     plane: plane::Handle,
     name: &str,
 ) -> Result<bool, DrmError> {
-    let props = dev.get_properties(plane).map_err(|source| DrmError::Access {
-        errmsg: "Failed to get properties of plane",
-        dev: dev.dev_path(),
-        source,
+    let props = dev.get_properties(plane).map_err(|source| {
+        DrmError::Access(AccessError {
+            errmsg: "Failed to get properties of plane",
+            dev: dev.dev_path(),
+            source,
+        })
     })?;
     let (ids, _) = props.as_props_and_values();
     for &id in ids {
-        let info = dev.get_property(id).map_err(|source| DrmError::Access {
-            errmsg: "Failed to get property info",
-            dev: dev.dev_path(),
-            source,
+        let info = dev.get_property(id).map_err(|source| {
+            DrmError::Access(AccessError {
+                errmsg: "Failed to get property info",
+                dev: dev.dev_path(),
+                source,
+            })
         })?;
         if info.name().to_str().map(|x| x == name).unwrap_or(false) {
             return Ok(true);

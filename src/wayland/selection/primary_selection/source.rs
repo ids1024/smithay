@@ -3,10 +3,7 @@ use std::sync::Mutex;
 use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_source_v1::{
     self as primary_source, ZwpPrimarySelectionSourceV1 as PrimarySource,
 };
-use wayland_server::{
-    backend::{ClientId, ObjectId},
-    Dispatch, DisplayHandle, Resource,
-};
+use wayland_server::{backend::ClientId, Dispatch, DisplayHandle, Resource};
 
 use crate::utils::{alive_tracker::AliveTracker, IsAlive};
 
@@ -22,7 +19,7 @@ pub struct SourceMetadata {
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct PrimarySourceUserData {
-    pub(super) inner: Mutex<SourceMetadata>,
+    pub(crate) inner: Mutex<SourceMetadata>,
     alive_tracker: AliveTracker,
 }
 
@@ -62,7 +59,7 @@ where
         }
     }
 
-    fn destroyed(_state: &mut D, _client: ClientId, _resource: ObjectId, data: &PrimarySourceUserData) {
+    fn destroyed(_state: &mut D, _client: ClientId, _resource: &PrimarySource, data: &PrimarySourceUserData) {
         data.alive_tracker.destroy_notify();
     }
 }
@@ -71,16 +68,5 @@ impl IsAlive for PrimarySource {
     fn alive(&self) -> bool {
         let data: &PrimarySourceUserData = self.data().unwrap();
         data.alive_tracker.alive()
-    }
-}
-
-/// Access the metadata of a data source
-pub fn with_source_metadata<T, F: FnOnce(&SourceMetadata) -> T>(
-    source: &PrimarySource,
-    f: F,
-) -> Result<T, crate::utils::UnmanagedResource> {
-    match source.data::<PrimarySourceUserData>() {
-        Some(data) => Ok(f(&data.inner.lock().unwrap())),
-        None => Err(crate::utils::UnmanagedResource),
     }
 }

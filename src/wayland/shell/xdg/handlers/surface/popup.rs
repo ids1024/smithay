@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::{
+    input::SeatHandler,
     utils::Serial,
     wayland::{
         compositor,
@@ -10,10 +11,7 @@ use crate::{
 
 use wayland_protocols::xdg::shell::server::xdg_popup::{self, XdgPopup};
 
-use wayland_server::{
-    backend::{ClientId, ObjectId},
-    DataInit, Dispatch, DisplayHandle, Resource,
-};
+use wayland_server::{backend::ClientId, DataInit, Dispatch, DisplayHandle, Resource};
 
 use super::{PopupConfigure, XdgShellHandler, XdgShellState, XdgShellSurfaceUserData, XdgSurfaceUserData};
 
@@ -21,6 +19,7 @@ impl<D> Dispatch<XdgPopup, XdgShellSurfaceUserData, D> for XdgShellState
 where
     D: Dispatch<XdgPopup, XdgShellSurfaceUserData>,
     D: XdgShellHandler,
+    D: SeatHandler,
     D: 'static,
 {
     fn request(
@@ -67,7 +66,7 @@ where
         }
     }
 
-    fn destroyed(state: &mut D, _client_id: ClientId, object_id: ObjectId, data: &XdgShellSurfaceUserData) {
+    fn destroyed(state: &mut D, _client_id: ClientId, xdg_popup: &XdgPopup, data: &XdgShellSurfaceUserData) {
         data.alive_tracker.destroy_notify();
 
         // remove this surface from the known ones (as well as any leftover dead surface)
@@ -75,7 +74,7 @@ where
             .xdg_shell_state()
             .known_popups
             .iter()
-            .position(|pop| pop.shell_surface.id() == object_id)
+            .position(|pop| pop.shell_surface.id() == xdg_popup.id())
         {
             let popup = state.xdg_shell_state().known_popups.remove(index);
             let surface = popup.wl_surface().clone();

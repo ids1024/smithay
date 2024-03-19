@@ -7,9 +7,9 @@
 //!
 //! ```
 //! use smithay::{
-//!     delegate_seat, delegate_tablet_manager, delegate_text_input_manager,
+//!     delegate_seat, delegate_text_input_manager,
 //! };
-//! use smithay::input::{Seat, SeatState, SeatHandler, keyboard::XkbConfig, pointer::CursorImageStatus};
+//! use smithay::input::{Seat, SeatState, SeatHandler, pointer::CursorImageStatus};
 //! use smithay::wayland::text_input::TextInputManagerState;
 //! use smithay::reexports::wayland_server::{Display, protocol::wl_surface::WlSurface};
 //!
@@ -149,8 +149,10 @@ where
                         input_method_handle: input_method_handle.clone(),
                     },
                 );
-
                 handle.add_instance(&instance);
+                if input_method_handle.has_instance() {
+                    handle.enter();
+                }
             }
             zwp_text_input_manager_v3::Request::Destroy => {
                 // Nothing to do
@@ -173,7 +175,8 @@ macro_rules! delegate_text_input_manager {
         ] => $crate::wayland::text_input::TextInputManagerState);
 
         $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::ZwpTextInputV3: $crate::wayland::text_input::TextInputUserData
+            $crate::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::ZwpTextInputV3:
+            $crate::wayland::text_input::TextInputUserData
         ] => $crate::wayland::text_input::TextInputManagerState);
     };
 }

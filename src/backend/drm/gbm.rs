@@ -1,13 +1,12 @@
 //! Utilities to attach [`framebuffer::Handle`]s to gbm backed buffers
 
 use std::os::unix::io::AsFd;
-use std::path::PathBuf;
 
 use thiserror::Error;
 
 use drm::{
     buffer::PlanarBuffer,
-    control::{framebuffer, Device},
+    control::{framebuffer, Device, FbCmd2Flags},
 };
 use drm_fourcc::DrmModifier;
 use gbm::BufferObject;
@@ -27,7 +26,7 @@ use crate::backend::{
 };
 use crate::utils::DevPath;
 
-use super::Framebuffer;
+use super::{error::AccessError, warn_legacy_fb_export, Framebuffer};
 
 /// A GBM backed framebuffer
 #[derive(Debug)]
@@ -176,39 +175,6 @@ pub fn framebuffer_from_dmabuf<A: AsFd + 'static>(
     })
 }
 
-/// Possible errors for attaching a [`framebuffer::Handle`] with [`framebuffer_from_bo`]
-#[derive(Debug, Error)]
-#[error("failed to add a framebuffer")]
-pub struct AccessError {
-    /// Error message associated to the access error
-    errmsg: &'static str,
-    /// Device on which the error was generated
-    dev: Option<PathBuf>,
-    /// Underlying device error
-    #[source]
-    pub source: drm::SystemError,
-}
-
-impl From<AccessError> for super::DrmError {
-    fn from(err: AccessError) -> Self {
-        super::DrmError::Access {
-            errmsg: err.errmsg,
-            dev: err.dev,
-            source: err.source,
-        }
-    }
-}
-
-impl TryFrom<super::DrmError> for AccessError {
-    type Error = super::DrmError;
-    fn try_from(err: super::DrmError) -> Result<Self, super::DrmError> {
-        match err {
-            super::DrmError::Access { errmsg, dev, source } => Ok(AccessError { errmsg, dev, source }),
-            err => Err(err),
-        }
-    }
-}
-
 /// Attach a [`framebuffer::Handle`] to an [`BufferObject`]
 #[profiling::function]
 pub fn framebuffer_from_bo<T>(
@@ -256,6 +222,13 @@ impl<'a, T: 'static> PlanarBuffer for BufferObjectInternal<'a, T> {
         PlanarBuffer::format(self.bo)
     }
 
+    fn modifier(&self) -> Option<DrmModifier> {
+        match self.bo.modifier().unwrap() {
+            DrmModifier::Invalid => None,
+            x => Some(x),
+        }
+    }
+
     fn pitches(&self) -> [u32; 4] {
         self.pitches.unwrap_or_else(|| PlanarBuffer::pitches(self.bo))
     }
@@ -283,6 +256,10 @@ where
         get_opaque(fmt).unwrap_or(fmt)
     }
 
+    fn modifier(&self) -> Option<DrmModifier> {
+        self.0.modifier()
+    }
+
     fn pitches(&self) -> [u32; 4] {
         self.0.pitches()
     }
@@ -305,69 +282,41 @@ fn framebuffer_from_bo_internal<D, T>(
 where
     D: drm::control::Device + DevPath,
 {
-    let modifier = match bo.modifier().unwrap() {
-        DrmModifier::Invalid => None,
-        x => Some(x),
+    let modifier = bo.modifier();
+    let flags = if bo.modifier().is_some() {
+        FbCmd2Flags::MODIFIERS
+    } else {
+        FbCmd2Flags::empty()
     };
 
-    let (fb, format) = match if modifier.is_some() {
-        let num = bo.plane_count().unwrap();
-        let modifiers = [
-            modifier,
-            if num > 1 { modifier } else { None },
-            if num > 2 { modifier } else { None },
-            if num > 3 { modifier } else { None },
-        ];
-        if use_opaque {
-            let opaque_wrapper = OpaqueBufferWrapper(&bo);
-            drm.add_planar_framebuffer(&opaque_wrapper, &modifiers, drm_ffi::DRM_MODE_FB_MODIFIERS)
-                .map(|fb| {
-                    (
-                        fb,
-                        drm_fourcc::DrmFormat {
-                            code: opaque_wrapper.format(),
-                            modifier: modifier.unwrap(),
-                        },
-                    )
-                })
-        } else {
-            drm.add_planar_framebuffer(&bo, &modifiers, drm_ffi::DRM_MODE_FB_MODIFIERS)
-                .map(|fb| {
-                    (
-                        fb,
-                        drm_fourcc::DrmFormat {
-                            code: bo.format(),
-                            modifier: modifier.unwrap(),
-                        },
-                    )
-                })
-        }
-    } else if use_opaque {
+    let ret = if use_opaque {
         let opaque_wrapper = OpaqueBufferWrapper(&bo);
-        drm.add_planar_framebuffer(&opaque_wrapper, &[None, None, None, None], 0)
-            .map(|fb| {
-                (
-                    fb,
-                    drm_fourcc::DrmFormat {
-                        code: opaque_wrapper.format(),
-                        modifier: drm_fourcc::DrmModifier::Invalid,
-                    },
-                )
-            })
+        drm.add_planar_framebuffer(&opaque_wrapper, flags).map(|fb| {
+            (
+                fb,
+                drm_fourcc::DrmFormat {
+                    code: opaque_wrapper.format(),
+                    modifier: modifier.unwrap_or(DrmModifier::Invalid),
+                },
+            )
+        })
     } else {
-        drm.add_planar_framebuffer(&bo, &[None, None, None, None], 0)
-            .map(|fb| {
-                (
-                    fb,
-                    drm_fourcc::DrmFormat {
-                        code: bo.format(),
-                        modifier: drm_fourcc::DrmModifier::Invalid,
-                    },
-                )
-            })
-    } {
+        drm.add_planar_framebuffer(&bo, flags).map(|fb| {
+            (
+                fb,
+                drm_fourcc::DrmFormat {
+                    code: bo.format(),
+                    modifier: modifier.unwrap_or(DrmModifier::Invalid),
+                },
+            )
+        })
+    };
+
+    let (fb, format) = match ret {
         Ok(fb) => fb,
         Err(source) => {
+            warn_legacy_fb_export();
+
             // We only support this as a fallback of last resort like xf86-video-modesetting does.
             if bo.plane_count().unwrap() > 1 {
                 return Err(AccessError {

@@ -51,9 +51,6 @@ mod xdg;
 
 pub use self::element::*;
 pub use self::grabs::*;
-#[cfg(feature = "xwayland")]
-pub use self::x11::*;
-pub use self::xdg::*;
 
 fn fullscreen_output_geometry(
     wl_surface: &WlSurface,
@@ -67,11 +64,11 @@ fn fullscreen_output_geometry(
         .or_else(|| {
             let w = space
                 .elements()
-                .find(|window| window.wl_surface().map(|s| s == *wl_surface).unwrap_or(false))
-                .cloned();
-            w.and_then(|w| space.outputs_for_element(&w).get(0).cloned())
+                .find(|window| window.wl_surface().map(|s| s == *wl_surface).unwrap_or(false));
+            w.and_then(|w| space.outputs_for_element(w).first().cloned())
         })
-        .and_then(|o| space.output_geometry(&o))
+        .as_ref()
+        .and_then(|o| space.output_geometry(o))
 }
 
 #[derive(Default)]
@@ -129,7 +126,7 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
                     let res = state.handle.insert_source(source, move |_, _, data| {
                         data.state
                             .client_compositor_state(&client)
-                            .blocker_cleared(&mut data.state, &data.display.handle());
+                            .blocker_cleared(&mut data.state, &data.display_handle);
                         Ok(())
                     });
                     if res.is_ok() {
@@ -152,8 +149,8 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
             while let Some(parent) = get_parent(&root) {
                 root = parent;
             }
-            if let Some(WindowElement::Wayland(window)) = self.window_for_surface(&root) {
-                window.on_commit();
+            if let Some(window) = self.window_for_surface(&root) {
+                window.0.on_commit();
             }
         }
         self.popups.commit(surface);
@@ -231,7 +228,7 @@ fn ensure_initial_configure(surface: &WlSurface, space: &Space<WindowElement>, p
     {
         // send the initial configure if relevant
         #[cfg_attr(not(feature = "xwayland"), allow(irrefutable_let_patterns))]
-        if let WindowElement::Wayland(ref toplevel) = window {
+        if let Some(toplevel) = window.0.toplevel() {
             let initial_configure_sent = with_states(surface, |states| {
                 states
                     .data_map
@@ -242,7 +239,7 @@ fn ensure_initial_configure(surface: &WlSurface, space: &Space<WindowElement>, p
                     .initial_configure_sent
             });
             if !initial_configure_sent {
-                toplevel.toplevel().send_configure();
+                toplevel.send_configure();
             }
         }
 
@@ -263,7 +260,14 @@ fn ensure_initial_configure(surface: &WlSurface, space: &Space<WindowElement>, p
     }
 
     if let Some(popup) = popups.find_popup(surface) {
-        let PopupKind::Xdg(ref popup) = popup;
+        let popup = match popup {
+            PopupKind::Xdg(ref popup) => popup,
+            // Doesn't require configure
+            PopupKind::InputMethod(ref _input_popup) => {
+                return;
+            }
+        };
+
         let initial_configure_sent = with_states(surface, |states| {
             states
                 .data_map
@@ -339,8 +343,8 @@ fn place_new_window(
 
     // set the initial toplevel bounds
     #[allow(irrefutable_let_patterns)]
-    if let WindowElement::Wayland(window) = window {
-        window.toplevel().with_pending_state(|state| {
+    if let Some(toplevel) = window.0.toplevel() {
+        toplevel.with_pending_state(|state| {
             state.bounds = Some(output_geometry.size);
         });
     }

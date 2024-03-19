@@ -26,11 +26,11 @@
 //! # extern crate wayland_server;
 //! #
 //! use smithay::delegate_xdg_shell;
-//! use smithay::reexports::wayland_server::protocol::wl_seat;
+//! use smithay::reexports::wayland_server::protocol::{wl_seat, wl_surface};
 //! use smithay::wayland::shell::xdg::{XdgShellState, XdgShellHandler, ToplevelSurface, PopupSurface, PositionerState};
 //! use smithay::utils::Serial;
 //!
-//! # struct State { xdg_shell_state: XdgShellState }
+//! # struct State { xdg_shell_state: XdgShellState, seat_state: SeatState<Self> }
 //! # let mut display = wayland_server::Display::<State>::new().unwrap();
 //! let xdg_shell_state = XdgShellState::new::<State>(
 //!     &display.handle(),
@@ -65,6 +65,33 @@
 //!     ) {
 //!         // ...
 //!     }
+//!     fn reposition_request(
+//!         &mut self,
+//!         surface: PopupSurface,
+//!         positioner: PositionerState,
+//!         token: u32,
+//!     ) {
+//!         // ...
+//!     }
+//! }
+//!
+//! use smithay::input::{Seat, SeatState, SeatHandler, pointer::CursorImageStatus};
+//!
+//! type Target = wl_surface::WlSurface;
+//! impl SeatHandler for State {
+//!     type KeyboardFocus = Target;
+//!     type PointerFocus = Target;
+//!
+//!     fn seat_state(&mut self) -> &mut SeatState<Self> {
+//!         &mut self.seat_state
+//!     }
+//!
+//!     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&Target>) {
+//!         // handle focus changes, if you need to ...
+//!     }
+//!     fn cursor_image(&mut self, seat: &Seat<Self>, image: CursorImageStatus) {
+//!         // handle new images for the cursor ...
+//!     }
 //! }
 //! delegate_xdg_shell!(State);
 //!
@@ -96,9 +123,11 @@ use crate::utils::{Serial, SERIAL_COUNTER};
 use crate::wayland::compositor;
 use crate::wayland::compositor::Cacheable;
 use crate::wayland::shell::is_toplevel_equivalent;
+use std::cmp::min;
 use std::{collections::HashSet, fmt::Debug, sync::Mutex};
 
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1;
+use wayland_protocols::xdg::shell::server::xdg_positioner::{Anchor, ConstraintAdjustment, Gravity};
 use wayland_protocols::xdg::shell::server::xdg_surface;
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_protocols::xdg::shell::server::{xdg_popup, xdg_positioner, xdg_toplevel, xdg_wm_base};
@@ -551,12 +580,14 @@ impl PositionerState {
     /// size set by `xdg_positioner.set_size`.
     ///
     /// `Rectangle::x` and `Rectangle::y` define the position of the
-    /// popup relative to it's parent surface `window_geometry`.
+    /// popup relative to its parent surface's `window_geometry`.
     /// The position is calculated according to the rules defined
     /// in the `xdg_shell` protocol.
     /// The `constraint_adjustment` will not be considered by this
     /// implementation and the position and size should be re-calculated
     /// in the compositor if the compositor implements `constraint_adjustment`
+    ///
+    /// [`PositionerState::get_unconstrained_geometry`] does take `constraint_adjustment` into account.
     pub fn get_geometry(&self) -> Rectangle<i32, Logical> {
         // From the `xdg_shell` prococol specification:
         //
@@ -614,6 +645,176 @@ impl PositionerState {
 
         geometry
     }
+
+    /// Get the geometry for a popup as defined by this positioner, after trying to fit the popup into the
+    /// target rectangle.
+    ///
+    /// `Rectangle::width` and `Rectangle::height` corresponds to the size set by `xdg_positioner.set_size`.
+    ///
+    /// `Rectangle::x` and `Rectangle::y` define the position of the popup relative to its parent surface's
+    /// `window_geometry`. The position is calculated according to the rules defined in the `xdg_shell`
+    /// protocol.
+    ///
+    /// This method does consider `constrain_adjustment` by trying to fit the popup into the provided target
+    /// rectangle. The target rectangle is in the same coordinate system as the rectangle returned by this
+    /// method. So, it is relative to the parent surface's geometry.
+    pub fn get_unconstrained_geometry(mut self, target: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+        // The protocol defines the following order for adjustments: flip, slide, resize. If the flip fails
+        // to remove the constraints, it is reverted.
+        //
+        // The adjustments are applied individually between axes. We can do that reasonably safely, given
+        // that both our target and our popup are simple rectangles. The code is grouped per adjustment for
+        // easier copy-paste checking, and because flips replace the geometry entirely, while further
+        // adjustments change individual fields.
+        let mut geo = self.get_geometry();
+        let (mut off_left, mut off_right, mut off_top, mut off_bottom) = compute_offsets(target, geo);
+
+        // Try to flip horizontally.
+        if (off_left > 0 || off_right > 0) && self.constraint_adjustment.contains(ConstraintAdjustment::FlipX)
+        {
+            let mut new = self;
+            new.anchor_edges = invert_anchor_x(new.anchor_edges);
+            new.gravity = invert_gravity_x(new.gravity);
+            let new_geo = new.get_geometry();
+            let (new_off_left, new_off_right, _, _) = compute_offsets(target, new_geo);
+
+            // Apply flip only if it removed the constraint.
+            if new_off_left <= 0 && new_off_right <= 0 {
+                self = new;
+                geo = new_geo;
+                off_left = 0;
+                off_right = 0;
+                // off_top and off_bottom are unchanged since we're using rectangles.
+            }
+        }
+
+        // Try to flip vertically.
+        if (off_top > 0 || off_bottom > 0) && self.constraint_adjustment.contains(ConstraintAdjustment::FlipY)
+        {
+            let mut new = self;
+            new.anchor_edges = invert_anchor_y(new.anchor_edges);
+            new.gravity = invert_gravity_y(new.gravity);
+            let new_geo = new.get_geometry();
+            let (_, _, new_off_top, new_off_bottom) = compute_offsets(target, new_geo);
+
+            // Apply flip only if it removed the constraint.
+            if new_off_top <= 0 && new_off_bottom <= 0 {
+                self = new;
+                geo = new_geo;
+                off_top = 0;
+                off_bottom = 0;
+                // off_left and off_right are unchanged since we're using rectangles.
+            }
+        }
+
+        // Try to slide horizontally.
+        if (off_left > 0 || off_right > 0)
+            && self.constraint_adjustment.contains(ConstraintAdjustment::SlideX)
+        {
+            // Prefer to show the top-left corner of the popup so that we can easily do a resize
+            // adjustment next.
+            if off_left > 0 {
+                geo.loc.x += off_left;
+            } else if off_right > 0 {
+                geo.loc.x -= min(off_right, -off_left);
+            }
+
+            (_, off_right, _, _) = compute_offsets(target, geo);
+            // off_top and off_bottom are the same since we're using rectangles.
+        }
+
+        // Try to slide vertically.
+        if (off_top > 0 || off_bottom > 0)
+            && self.constraint_adjustment.contains(ConstraintAdjustment::SlideY)
+        {
+            // Prefer to show the top-left corner of the popup so that we can easily do a resize
+            // adjustment next.
+            if off_top > 0 {
+                geo.loc.y += off_top;
+            } else if off_bottom > 0 {
+                geo.loc.y -= min(off_bottom, -off_top);
+            }
+
+            (_, _, _, off_bottom) = compute_offsets(target, geo);
+            // off_left and off_right are the same since we're using rectangles.
+        }
+
+        // Try to resize horizontally. This makes sense only if the popup is at least partially to the left
+        // of the right target edge, which is the same as checking that the offset is smaller than the width.
+        if off_right > 0
+            && off_right < geo.size.w
+            && self.constraint_adjustment.contains(ConstraintAdjustment::ResizeX)
+        {
+            geo.size.w -= off_right;
+        }
+
+        // Try to resize vertically. This makes sense only if the popup is at least partially to the top of
+        // the bottom target edge, which is the same as checking that the offset is smaller than the height.
+        if off_bottom > 0
+            && off_bottom < geo.size.h
+            && self.constraint_adjustment.contains(ConstraintAdjustment::ResizeY)
+        {
+            geo.size.h -= off_bottom;
+        }
+
+        geo
+    }
+}
+
+fn compute_offsets(target: Rectangle<i32, Logical>, popup: Rectangle<i32, Logical>) -> (i32, i32, i32, i32) {
+    let off_left = target.loc.x - popup.loc.x;
+    let off_right = (popup.loc.x + popup.size.w) - (target.loc.x + target.size.w);
+    let off_top = target.loc.y - popup.loc.y;
+    let off_bottom = (popup.loc.y + popup.size.h) - (target.loc.y + target.size.h);
+    (off_left, off_right, off_top, off_bottom)
+}
+
+fn invert_anchor_x(anchor: Anchor) -> Anchor {
+    match anchor {
+        Anchor::Left => Anchor::Right,
+        Anchor::Right => Anchor::Left,
+        Anchor::TopLeft => Anchor::TopRight,
+        Anchor::TopRight => Anchor::TopLeft,
+        Anchor::BottomLeft => Anchor::BottomRight,
+        Anchor::BottomRight => Anchor::BottomLeft,
+        x => x,
+    }
+}
+
+fn invert_anchor_y(anchor: Anchor) -> Anchor {
+    match anchor {
+        Anchor::Top => Anchor::Bottom,
+        Anchor::Bottom => Anchor::Top,
+        Anchor::TopLeft => Anchor::BottomLeft,
+        Anchor::TopRight => Anchor::BottomRight,
+        Anchor::BottomLeft => Anchor::TopLeft,
+        Anchor::BottomRight => Anchor::TopRight,
+        x => x,
+    }
+}
+
+fn invert_gravity_x(gravity: Gravity) -> Gravity {
+    match gravity {
+        Gravity::Left => Gravity::Right,
+        Gravity::Right => Gravity::Left,
+        Gravity::TopLeft => Gravity::TopRight,
+        Gravity::TopRight => Gravity::TopLeft,
+        Gravity::BottomLeft => Gravity::BottomRight,
+        Gravity::BottomRight => Gravity::BottomLeft,
+        x => x,
+    }
+}
+
+fn invert_gravity_y(gravity: Gravity) -> Gravity {
+    match gravity {
+        Gravity::Top => Gravity::Bottom,
+        Gravity::Bottom => Gravity::Top,
+        Gravity::TopLeft => Gravity::BottomLeft,
+        Gravity::TopRight => Gravity::BottomRight,
+        Gravity::BottomLeft => Gravity::TopLeft,
+        Gravity::BottomRight => Gravity::TopRight,
+        x => x,
+    }
 }
 
 /// State of a regular toplevel surface
@@ -638,7 +839,7 @@ pub struct ToplevelState {
     pub decoration_mode: Option<zxdg_toplevel_decoration_v1::Mode>,
 
     /// The wm capabilities for this toplevel
-    pub capabilities: WmCapabilitieSet,
+    pub capabilities: WmCapabilitySet,
 }
 
 impl Clone for ToplevelState {
@@ -763,11 +964,11 @@ impl From<ToplevelStateSet> for Vec<xdg_toplevel::State> {
 
 /// Container holding the [`xdg_toplevel::WmCapabilities`] for a toplevel
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
-pub struct WmCapabilitieSet {
+pub struct WmCapabilitySet {
     capabilities: HashSet<xdg_toplevel::WmCapabilities>,
 }
 
-impl WmCapabilitieSet {
+impl WmCapabilitySet {
     /// Returns `true` if the set contains a capability.
     pub fn contains(&self, capability: xdg_toplevel::WmCapabilities) -> bool {
         self.capabilities.contains(&capability)
@@ -800,7 +1001,7 @@ impl WmCapabilitieSet {
     }
 }
 
-impl<T> From<T> for WmCapabilitieSet
+impl<T> From<T> for WmCapabilitySet
 where
     T: IntoIterator<Item = xdg_toplevel::WmCapabilities>,
 {
@@ -930,8 +1131,10 @@ pub trait XdgShellHandler {
     /// A surface has acknowledged a configure serial.
     fn ack_configure(&mut self, surface: wl_surface::WlSurface, configure: Configure) {}
 
-    /// A client requested a reposition, providing a new
-    /// positioner, of a popup.
+    /// A client requested a reposition, providing a new positioner for a popup.
+    ///
+    /// To confirm the new popup position, `PopupSurface::send_repositioned` must be
+    /// called on the provided surface with the token.
     ///
     /// ## Arguments
     ///
@@ -944,13 +1147,22 @@ pub trait XdgShellHandler {
     ///     The new popup position will not take effect until the corresponding configure event
     ///     is acknowledged by the client. See xdg_popup.repositioned for details.
     ///     The token itself is opaque, and has no other special meaning.
-    fn reposition_request(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32) {}
+    fn reposition_request(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32);
+
+    /// A shell client was destroyed.
+    fn client_destroyed(&mut self, client: ShellClient) {}
 
     /// A toplevel surface was destroyed.
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {}
 
     /// A popup surface was destroyed.
     fn popup_destroyed(&mut self, surface: PopupSurface) {}
+
+    /// The toplevel surface set a different app id.
+    fn app_id_changed(&mut self, surface: ToplevelSurface) {}
+
+    /// The toplevel surface set a different title.
+    fn title_changed(&mut self, surface: ToplevelSurface) {}
 }
 
 /// Shell global state
@@ -961,7 +1173,7 @@ pub trait XdgShellHandler {
 pub struct XdgShellState {
     known_toplevels: Vec<ToplevelSurface>,
     known_popups: Vec<PopupSurface>,
-    default_capabilities: WmCapabilitieSet,
+    default_capabilities: WmCapabilitySet,
     global: GlobalId,
 }
 
@@ -985,7 +1197,7 @@ impl XdgShellState {
     /// Create a new `xdg_shell` global with a specific set of [`WmCapabilities`](xdg_toplevel::WmCapabilities)
     pub fn new_with_capabilities<D>(
         display: &DisplayHandle,
-        capabilities: impl Into<WmCapabilitieSet>,
+        capabilities: impl Into<WmCapabilitySet>,
     ) -> XdgShellState
     where
         D: GlobalDispatch<XdgWmBase, ()> + 'static,
@@ -1005,7 +1217,7 @@ impl XdgShellState {
     /// *Note*: This does not update the capabilities on existing toplevels, only new
     /// toplevels are affected. To update existing toplevels iterate over them,
     /// update their capabilities and send a configure.
-    pub fn replace_capabilities(&mut self, capabilities: impl Into<WmCapabilitieSet>) {
+    pub fn replace_capabilities(&mut self, capabilities: impl Into<WmCapabilitySet>) {
         self.default_capabilities = capabilities.into();
     }
 
@@ -1100,6 +1312,21 @@ impl ShellClient {
         }
         guard.pending_ping = Some(serial);
         self.kind.ping(serial.into());
+
+        Ok(())
+    }
+
+    /// Kill the shell client for being unresponsive.
+    ///
+    /// Generally this will be used if the client does not respond to a ping in a reasonable amount of time.
+    pub fn unresponsive(&self) -> Result<(), crate::utils::DeadResource> {
+        if !self.alive() {
+            return Err(crate::utils::DeadResource);
+        }
+        self.kind.post_error(
+            xdg_wm_base::Error::Unresponsive,
+            "client did not respond to ping on time",
+        );
 
         Ok(())
     }

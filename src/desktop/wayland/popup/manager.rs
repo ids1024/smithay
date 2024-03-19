@@ -4,7 +4,7 @@ use crate::{
     wayland::{
         compositor::{get_role, with_states},
         seat::WaylandFocus,
-        shell::xdg::{XdgPopupSurfaceData, XDG_POPUP_ROLE},
+        shell::xdg::{XdgPopupSurfaceData, XdgPopupSurfaceRoleAttributes, XDG_POPUP_ROLE},
     },
 };
 use std::sync::{Arc, Mutex};
@@ -88,6 +88,9 @@ impl PopupManager {
                     return Err(PopupGrabError::InvalidGrab);
                 }
             }
+            PopupKind::InputMethod(ref _input_method) => {
+                return Err(PopupGrabError::InvalidGrab);
+            }
         }
 
         // The primary store for the grab is the seat, additional we store it
@@ -156,7 +159,7 @@ impl PopupManager {
     pub fn find_popup(&self, surface: &WlSurface) -> Option<PopupKind> {
         self.unmapped_popups
             .iter()
-            .find(|p| p.wl_surface() == surface)
+            .find(|p| p.wl_surface() == surface && p.alive())
             .cloned()
             .or_else(|| {
                 self.popup_trees
@@ -179,7 +182,8 @@ impl PopupManager {
         })
     }
 
-    pub(crate) fn dismiss_popup(surface: &WlSurface, popup: &PopupKind) -> Result<(), DeadResource> {
+    /// Dismiss the `popup` associated with the `surface.
+    pub fn dismiss_popup(surface: &WlSurface, popup: &PopupKind) -> Result<(), DeadResource> {
         if !surface.alive() {
             return Err(DeadResource);
         }
@@ -222,10 +226,50 @@ pub fn find_popup_root_surface(popup: &PopupKind) -> Result<WlSurface, DeadResou
                 .parent
                 .as_ref()
                 .cloned()
+        })
+        .ok_or(DeadResource)?;
+    }
+    Ok(parent)
+}
+
+/// Computes this popup's location relative to its toplevel wl_surface's geometry.
+///
+/// This function will go up the parent stack and add up the relative locations. Useful for
+/// transitive children popups.
+pub fn get_popup_toplevel_coords(popup: &PopupKind) -> Point<i32, Logical> {
+    let mut parent = match popup.parent() {
+        Some(parent) => parent,
+        None => return (0, 0).into(),
+    };
+
+    let mut offset = (0, 0).into();
+    while get_role(&parent) == Some(XDG_POPUP_ROLE) {
+        offset += with_states(&parent, |states| {
+            states
+                .data_map
+                .get::<Mutex<XdgPopupSurfaceRoleAttributes>>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .current
+                .geometry
+                .loc
+        });
+        parent = with_states(&parent, |states| {
+            states
+                .data_map
+                .get::<Mutex<XdgPopupSurfaceRoleAttributes>>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .parent
+                .as_ref()
+                .cloned()
                 .unwrap()
         });
     }
-    Ok(parent)
+
+    offset
 }
 
 #[derive(Debug, Default, Clone)]
@@ -243,6 +287,7 @@ impl PopupTree {
             .lock()
             .unwrap()
             .iter()
+            .filter(|node| node.surface.alive())
             .flat_map(|n| n.iter_popups_relative_to((0, 0)).map(|(p, l)| (p.clone(), l)))
             .collect::<Vec<_>>()
             .into_iter()
@@ -302,6 +347,7 @@ impl PopupNode {
         let relative_to = loc.into() + self.surface.location();
         self.children
             .iter()
+            .filter(|node| node.surface.alive())
             .flat_map(move |x| {
                 Box::new(x.iter_popups_relative_to(relative_to))
                     as Box<dyn Iterator<Item = (&PopupKind, Point<i32, Logical>)>>

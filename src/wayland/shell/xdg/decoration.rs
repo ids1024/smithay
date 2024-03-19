@@ -12,11 +12,11 @@
 //! use smithay::wayland::shell::xdg::{ToplevelSurface, XdgShellHandler};
 //! # use smithay::utils::Serial;
 //! # use smithay::wayland::shell::xdg::{XdgShellState, PopupSurface, PositionerState};
-//! # use smithay::reexports::wayland_server::protocol::wl_seat;
+//! # use smithay::reexports::wayland_server::protocol::{wl_seat, wl_surface};
 //! use smithay::wayland::shell::xdg::decoration::{XdgDecorationState, XdgDecorationHandler};
 //! use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
 //!
-//! # struct State { decoration_state: XdgDecorationState }
+//! # struct State { decoration_state: XdgDecorationState, seat_state: SeatState<Self> }
 //! # let mut display = wayland_server::Display::<State>::new().unwrap();
 //!
 //! // Create a decoration state
@@ -42,6 +42,12 @@
 //!     #     seat: wl_seat::WlSeat,
 //!     #     serial: Serial,
 //!     # ) { unimplemented!() }
+//!     # fn reposition_request(
+//!     #     &mut self,
+//!     #     surface: PopupSurface,
+//!     #     positioner: PositionerState,
+//!     #     token: u32,
+//!     # ) { unimplemented!() }
 //!     // ...
 //! }
 //! impl XdgDecorationHandler for State {
@@ -54,6 +60,25 @@
 //!     }
 //!     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: Mode) { /* ... */ }
 //!     fn unset_mode(&mut self, toplevel: ToplevelSurface) { /* ... */ }
+//! }
+//!
+//! use smithay::input::{Seat, SeatState, SeatHandler, pointer::CursorImageStatus};
+//!
+//! type Target = wl_surface::WlSurface;
+//! impl SeatHandler for State {
+//!     type KeyboardFocus = Target;
+//!     type PointerFocus = Target;
+//!
+//!     fn seat_state(&mut self) -> &mut SeatState<Self> {
+//!         &mut self.seat_state
+//!     }
+//!
+//!     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&Target>) {
+//!         // handle focus changes, if you need to ...
+//!     }
+//!     fn cursor_image(&mut self, seat: &Seat<Self>, image: CursorImageStatus) {
+//!         // handle new images for the cursor ...
+//!     }
 //! }
 //! delegate_xdg_shell!(State);
 //! delegate_xdg_decoration!(State);
@@ -78,18 +103,46 @@ pub struct XdgDecorationState {
     global: GlobalId,
 }
 
+/// Data associated with a XdgDecorationManager global.
+#[allow(missing_debug_implementations)]
+pub struct XdgDecorationManagerGlobalData {
+    filter: Box<dyn for<'c> Fn(&'c Client) -> bool + Send + Sync>,
+}
+
 impl XdgDecorationState {
     /// Creates a new delegate type for handling xdg decoration events.
     ///
     /// A global id is also returned to allow destroying the global in the future.
     pub fn new<D>(display: &DisplayHandle) -> XdgDecorationState
     where
-        D: GlobalDispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()>
-            + Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()>
+        D: GlobalDispatch<
+                zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+                XdgDecorationManagerGlobalData,
+            > + Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()>
             + 'static,
     {
+        Self::new_with_filter::<D, _>(display, |_| true)
+    }
+
+    /// Creates a new delegate type for handling xdg decoration events with a filter.
+    ///
+    /// Filters can be used to limit visibility of a global to certain clients.
+    ///
+    /// A global id is also returned to allow destroying the global in the future.
+    pub fn new_with_filter<D, F>(display: &DisplayHandle, filter: F) -> XdgDecorationState
+    where
+        D: GlobalDispatch<
+                zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+                XdgDecorationManagerGlobalData,
+            > + Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()>
+            + 'static,
+        F: for<'c> Fn(&'c Client) -> bool + Send + Sync + 'static,
+    {
+        let data = XdgDecorationManagerGlobalData {
+            filter: Box::new(filter),
+        };
         let global =
-            display.create_global::<D, zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _>(1, ());
+            display.create_global::<D, zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _>(1, data);
 
         XdgDecorationState { global }
     }
@@ -119,7 +172,7 @@ pub trait XdgDecorationHandler {
 macro_rules! delegate_xdg_decoration {
     ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
         $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1: ()
+            $crate::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1: $crate::wayland::shell::xdg::decoration::XdgDecorationManagerGlobalData
         ] => $crate::wayland::shell::xdg::decoration::XdgDecorationState);
 
         $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
@@ -138,9 +191,10 @@ pub(super) fn send_decoration_configure(
     id.configure(mode)
 }
 
-impl<D> GlobalDispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, (), D> for XdgDecorationState
+impl<D> GlobalDispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, XdgDecorationManagerGlobalData, D>
+    for XdgDecorationState
 where
-    D: GlobalDispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()>
+    D: GlobalDispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, XdgDecorationManagerGlobalData>
         + Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()>
         + Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ToplevelSurface>
         + XdgShellHandler
@@ -152,10 +206,14 @@ where
         _: &DisplayHandle,
         _: &Client,
         resource: New<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
-        _: &(),
+        _: &XdgDecorationManagerGlobalData,
         data_init: &mut DataInit<'_, D>,
     ) {
         data_init.init(resource, ());
+    }
+
+    fn can_view(client: Client, global_data: &XdgDecorationManagerGlobalData) -> bool {
+        (global_data.filter)(&client)
     }
 }
 

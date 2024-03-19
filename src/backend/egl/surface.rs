@@ -20,7 +20,7 @@ use tracing::{debug, info_span, instrument};
 pub struct EGLSurface {
     pub(crate) display: Arc<EGLDisplayHandle>,
     native: Box<dyn EGLNativeSurface + Send + 'static>,
-    pub(crate) surface: AtomicPtr<nix::libc::c_void>,
+    pub(crate) surface: AtomicPtr<std::ffi::c_void>,
     config_id: ffi::egl::types::EGLConfig,
     pixel_format: PixelFormat,
     damage_impl: DamageSupport,
@@ -107,7 +107,10 @@ impl EGLSurface {
             debug!(
                 "Failed to query buffer age value for surface {:?}: {}",
                 self,
-                EGLError::from_last_call().unwrap_err()
+                EGLError::from_last_call().unwrap_or_else(|| {
+                    tracing::warn!("Erroneous EGL call didn't set EGLError");
+                    EGLError::Unknown(0)
+                })
             );
             None
         } else {
@@ -142,7 +145,10 @@ impl EGLSurface {
                 parent: &self.span,
                 "Failed to query size value for surface {:?}: {}",
                 self,
-                EGLError::from_last_call().unwrap_err()
+                EGLError::from_last_call().unwrap_or_else(|| {
+                    tracing::warn!("Erroneous EGL call didn't set EGLError");
+                    EGLError::Unknown(0)
+                })
             );
             None
         } else {

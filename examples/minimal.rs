@@ -1,5 +1,6 @@
 use std::{os::unix::io::OwnedFd, sync::Arc};
 
+use ::winit::platform::pump_events::PumpStatus;
 use smithay::{
     backend::{
         input::{InputEvent, KeyboardKeyEvent},
@@ -24,7 +25,10 @@ use smithay::{
             with_surface_tree_downward, CompositorClientState, CompositorHandler, CompositorState,
             SurfaceAttributes, TraversalAction,
         },
-        data_device::{ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler},
+        selection::{
+            data_device::{ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler},
+            SelectionHandler,
+        },
         shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState},
         shm::{ShmHandler, ShmState},
     },
@@ -62,10 +66,17 @@ impl XdgShellHandler for App {
     fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
         // Handle popup grab here
     }
+
+    fn reposition_request(&mut self, _surface: PopupSurface, _positioner: PositionerState, _token: u32) {
+        // Handle popup reposition here
+    }
+}
+
+impl SelectionHandler for App {
+    type SelectionUserData = ();
 }
 
 impl DataDeviceHandler for App {
-    type SelectionUserData = ();
     fn data_device_state(&self) -> &DataDeviceState {
         &self.data_device_state
     }
@@ -161,7 +172,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     std::process::Command::new("weston-terminal").spawn().ok();
 
     loop {
-        winit.dispatch_new_events(|event| match event {
+        let status = winit.dispatch_new_events(|event| match event {
             WinitEvent::Resized { .. } => {}
             WinitEvent::Input(event) => match event {
                 InputEvent::Keyboard { event } => {
@@ -186,11 +197,16 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                 _ => {}
             },
             _ => (),
-        })?;
+        });
+
+        match status {
+            PumpStatus::Continue => (),
+            PumpStatus::Exit(_) => return Ok(()),
+        };
 
         backend.bind().unwrap();
 
-        let size = backend.window_size().physical_size;
+        let size = backend.window_size();
         let damage = Rectangle::from_loc_and_size((0, 0), size);
 
         let elements = state

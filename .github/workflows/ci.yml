@@ -63,9 +63,7 @@ jobs:
       - name: Clean cargo cache of old items
         run: cargo cache clean-unref
       - name: System dependencies
-        run: sudo apt-get update; sudo apt-get install -y libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev
-      - name: Downgrade log
-        run: cargo update -p log --precise 0.4.14
+        run: sudo apt-get update; sudo apt-get install -y libdrm-dev libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev
       - name: Clippy Smithay
         run: cargo clippy --features "test_all_features" -- -D warnings
       - name: Clippy Anvil
@@ -79,14 +77,13 @@ jobs:
 
     runs-on: ubuntu-22.04
     needs:
-      - clippy-check
-      - format
+      - smithay-check-features
 
     steps:
       - name: Checkout sources
         uses: actions/checkout@v3
       - name: Rust toolchain
-        uses: dtolnay/rust-toolchain@1.65.0
+        uses: dtolnay/rust-toolchain@1.72.0
       - name: Get date for registry cache
         id: date
         run: echo "::set-output name=date::$(date +'%Y-%m-%d')"
@@ -100,9 +97,7 @@ jobs:
           key: ${{ runner.os }}-cargo-registry-${{ steps.date.outputs.date }}
           restore-keys: ${{ runner.os }}-cargo-registry-
       - name: System dependencies
-        run: sudo apt-get update; sudo apt-get install -y libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev
-      - name: Downgrade log
-        run: cargo update -p log --precise 0.4.14
+        run: sudo apt-get update; sudo apt-get install -y libdrm-dev libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev
       - name: Check
         run: cargo check --features "test_all_features"
 
@@ -112,18 +107,13 @@ jobs:
 
     runs-on: ubuntu-22.04
     needs:
-      - clippy-check
-      - format
+      - smithay-check-features
 
     steps:
       - name: Checkout sources
         uses: actions/checkout@v3
       - name: Rust toolchain
-        # currently nightly has an ICE affecting bytemuck
-        # see: https://github.com/Lokathor/bytemuck/issues/197
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2023-06-17
+        uses: dtolnay/rust-toolchain@nightly
       - name: Get date for registry cache
         id: date
         run: echo "::set-output name=date::$(date +'%Y-%m-%d')"
@@ -137,39 +127,55 @@ jobs:
           key: ${{ runner.os }}-cargo-registry-${{ steps.date.outputs.date }}
           restore-keys: ${{ runner.os }}-cargo-registry-
       - name: System dependencies
-        run: sudo apt-get update; sudo apt-get install -y libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev
+        run: sudo apt-get update; sudo apt-get install -y libdrm-dev libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev
       - name: Downgrade to minimal dependencies
         run: cargo update -Z minimal-versions
+      - name: Fixup ahash with current nightly
+        run: cargo update -p ahash --precise 0.8.7
       - name: Check
         run: cargo check --features "test_all_features"
 
+  smithay-check-features:
+
+    env:
+      RUSTFLAGS: "-D warnings"
+
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v3
+
+      - name: Get date for registry cache
+        id: date
+        run: echo "::set-output name=date::$(date +'%Y-%m-%d')"
+      - name: Cargo registry cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ steps.date.outputs.date }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+
+      - name: System dependencies
+        run: sudo apt-get update; sudo apt-get install -y libdrm-dev libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev
+
+      - name: Test features
+        env:
+          RUST_BACKTRACE: full
+        run: cargo hack check --each-feature --no-dev-deps
+
   smithay-tests:
     needs:
-      - format
-      - clippy-check
-    strategy:
-      fail-fast: false
-      matrix:
-        features:
-        - ''
-        - backend_winit
-        - backend_drm
-        - backend_gbm
-        - backend_egl
-        - backend_libinput
-        - backend_udev
-        - backend_session
-        - backend_session_libseat
-        - backend_vulkan
-        - backend_x11
-        - desktop
-        - renderer_gl
-        - renderer_glow
-        - renderer_multi
-        - wayland_frontend
-        - xwayland
-        - default
-        - test_all_features
+      - smithay-check-features
 
     env:
       RUSTFLAGS: "-D warnings"
@@ -197,23 +203,16 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       
       - name: System dependencies
-        run: sudo apt-get update; sudo apt-get install -y libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev
-
-      - name: Downgrade log
-        run: cargo update -p log --precise 0.4.14
+        run: sudo apt-get update; sudo apt-get install -y libdrm-dev libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev
       
-      - name: Test features
+      - name: Run tests
         env:
           RUST_BACKTRACE: full
-        run: cargo test --no-default-features --features "${{ matrix.features }}"
+        run: cargo test --features "test_all_features"
 
-  smallvil:
+  smallvil-check:
     needs:
-      - format
-      - clippy-check
-      - smithay-tests
-    strategy:
-      fail-fast: false
+      - smithay-check-features
 
     env:
       RUSTFLAGS: "-D warnings"
@@ -243,30 +242,14 @@ jobs:
       - name: System dependencies
         run: sudo apt-get update; sudo apt-get install -y libxkbcommon-dev libegl1-mesa-dev libwayland-dev
       
-      - name: Downgrade log
-        run: cargo update -p log --precise 0.4.14
-      
       - name: Test smallvil
         env:
           RUST_BACKTRACE: full
-        run: cargo test --manifest-path "./smallvil/Cargo.toml"
+        run: cargo check --manifest-path "./smallvil/Cargo.toml"
 
-  anvil-tests:
+  anvil-check-features:
     needs:
-      - format
-      - clippy-check
-      - smithay-tests
-    strategy:
-      fail-fast: false
-      matrix:
-        features:
-        - ''
-        - egl
-        - winit
-        - udev
-        - x11
-        - default
-        - test_all_features
+      - smithay-check-features
 
     env:
       RUSTFLAGS: "-D warnings"
@@ -293,23 +276,20 @@ jobs:
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+
       - name: System dependencies
-        run: sudo apt-get update; sudo apt-get install -y libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev
-      
-      - name: Downgrade log
-        run: cargo update -p log --precise 0.4.14
+        run: sudo apt-get update; sudo apt-get install -y libdrm-dev libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev
       
       - name: Test features
         env:
           RUST_BACKTRACE: full
-        run: cargo test --manifest-path "./anvil/Cargo.toml" --no-default-features --features "${{ matrix.features }}"
+        run: cargo hack check --each-feature --manifest-path "./anvil/Cargo.toml" --exclude-features profile-with-puffin,profile-with-tracy,profile-with-tracy-mem
 
   anvil-wlcs:
     needs:
-      - format
-      - clippy-check
-      - smithay-tests
-      - anvil-tests
+      - anvil-check-features
 
     strategy:
       fail-fast: false
@@ -354,11 +334,8 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-registry-
 
       - name: Rust toolchain
-        # nightly changed no_coverage to coverage(off) which breaks the build
-        # see: https://github.com/rust-lang/rust/pull/114656
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly-2023-06-17
           components: llvm-tools-preview
 
       - name: grcov cache
@@ -385,9 +362,6 @@ jobs:
       - name: Build WLCS
         run: ./compile_wlcs.sh
 
-      - name: Downgrade log
-        run: cargo update -p log --precise 0.4.14
-
       - name: Build anvil WLCS plugin
         env:
           RUST_BACKTRACE: full
@@ -411,7 +385,7 @@ jobs:
     name: Documentation on Github Pages
     runs-on: ubuntu-22.04
     needs:
-      - smithay-tests
+      - smithay-check-features
 
     steps:
       - name: Checkout sources
@@ -431,22 +405,15 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-registry-
 
       - name: Rust toolchain
-        # currently nightly has an ICE affecting bytemuck
-        # see: https://github.com/Lokathor/bytemuck/issues/197
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2023-06-17
+        uses: dtolnay/rust-toolchain@nightly
 
       - name: System dependencies
         run: sudo apt-get update; sudo apt-get install -y libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev
       
-      - name: Downgrade log
-        run: cargo update -p log --precise 0.4.14
-      
       - name: Build Documentation
         env: 
           RUSTDOCFLAGS: --cfg=docsrs
-        run: cargo doc --no-deps --features "test_all_features" -p smithay -p calloop:0.10.6 -p drm -p gbm -p input -p nix:0.26.4 -p udev -p wayland-server -p wayland-backend -p wayland-protocols:0.30.1 -p winit -p x11rb
+        run: cargo doc --no-deps --features "test_all_features" -p smithay -p calloop -p drm -p gbm -p input -p udev -p wayland-server -p wayland-backend -p wayland-protocols -p winit -p x11rb -p tracing
         
       - name: Setup index
         run: cp ./doc_index.html ./target/doc/index.html

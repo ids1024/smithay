@@ -6,10 +6,9 @@ use std::{
 use wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_keyboard_grab_v2::{
     self, ZwpInputMethodKeyboardGrabV2,
 };
-use wayland_server::backend::{ClientId, ObjectId};
+use wayland_server::backend::ClientId;
 use wayland_server::Dispatch;
 
-use crate::backend::input::KeyState;
 use crate::input::{
     keyboard::{
         GrabStartData as KeyboardGrabStartData, KeyboardGrab, KeyboardHandle, KeyboardInnerHandle,
@@ -17,16 +16,15 @@ use crate::input::{
     },
     SeatHandler,
 };
-use crate::wayland::{seat::WaylandFocus, text_input::TextInputHandle};
+use crate::wayland::text_input::TextInputHandle;
+use crate::{backend::input::KeyState, utils::Serial};
 
-use super::input_method_popup_surface::InputMethodPopupSurfaceHandle;
 use super::InputMethodManagerState;
 
 #[derive(Default, Debug)]
 pub(crate) struct InputMethodKeyboard {
     pub grab: Option<ZwpInputMethodKeyboardGrabV2>,
     pub text_input_handle: TextInputHandle,
-    pub popup_handle: InputMethodPopupSurfaceHandle,
 }
 
 /// Handle to an input method instance
@@ -38,7 +36,6 @@ pub struct InputMethodKeyboardGrab {
 impl<D> KeyboardGrab<D> for InputMethodKeyboardGrab
 where
     D: SeatHandler + 'static,
-    <D as SeatHandler>::KeyboardFocus: WaylandFocus,
 {
     fn input(
         &mut self,
@@ -47,23 +44,25 @@ where
         keycode: u32,
         key_state: KeyState,
         modifiers: Option<ModifiersState>,
-        _serial: crate::utils::Serial,
+        serial: Serial,
         time: u32,
     ) {
         let inner = self.inner.lock().unwrap();
         let keyboard = inner.grab.as_ref().unwrap();
-        inner.text_input_handle.with_focused_text_input(|_, _, serial| {
-            if let Some(serialized) = modifiers.map(|m| m.serialized) {
-                keyboard.modifiers(
-                    *serial,
-                    serialized.depressed,
-                    serialized.latched,
-                    serialized.locked,
-                    serialized.layout_effective,
-                )
-            }
-            keyboard.key(*serial, time, keycode, key_state.into());
-        });
+        inner
+            .text_input_handle
+            .focused_text_input_serial_or_default(serial.0, |serial| {
+                keyboard.key(serial, time, keycode, key_state.into());
+                if let Some(serialized) = modifiers.map(|m| m.serialized) {
+                    keyboard.modifiers(
+                        serial,
+                        serialized.depressed,
+                        serialized.latched,
+                        serialized.locked,
+                        serialized.layout_effective,
+                    )
+                }
+            });
     }
 
     fn set_focus(
@@ -99,7 +98,12 @@ impl<D: SeatHandler> fmt::Debug for InputMethodKeyboardUserData<D> {
 impl<D: SeatHandler + 'static> Dispatch<ZwpInputMethodKeyboardGrabV2, InputMethodKeyboardUserData<D>, D>
     for InputMethodManagerState
 {
-    fn destroyed(_state: &mut D, _client: ClientId, _id: ObjectId, data: &InputMethodKeyboardUserData<D>) {
+    fn destroyed(
+        _state: &mut D,
+        _client: ClientId,
+        _object: &ZwpInputMethodKeyboardGrabV2,
+        data: &InputMethodKeyboardUserData<D>,
+    ) {
         data.handle.inner.lock().unwrap().grab = None;
         data.keyboard_handle.unset_grab();
     }

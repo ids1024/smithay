@@ -1,10 +1,8 @@
-// TODO: Update to use new `Scroll*` events instead of now deprecated
-// `PointerAxis*`.
-#![cfg_attr(feature = "libinput_1_19", allow(deprecated))]
-
 //! Implementation of input backend trait for types provided by `libinput`
 
-use crate::backend::input::{self as backend, Axis, InputBackend, InputEvent};
+use crate::backend::input::{
+    self as backend, Axis, AxisRelativeDirection, AxisSource, InputBackend, InputEvent,
+};
 #[cfg(feature = "backend_session")]
 use crate::backend::session::{AsErrno, Session};
 use input as libinput;
@@ -12,14 +10,11 @@ use input::event;
 
 use std::{
     io,
-    os::unix::io::{AsRawFd, RawFd},
+    os::unix::io::{AsFd, BorrowedFd},
     path::PathBuf,
 };
 #[cfg(feature = "backend_session")]
-use std::{
-    os::unix::io::{FromRawFd, IntoRawFd, OwnedFd},
-    path::Path,
-};
+use std::{os::unix::io::OwnedFd, path::Path};
 
 use calloop::{EventSource, Interest, Mode, Poll, PostAction, Readiness, Token, TokenFactory};
 
@@ -130,37 +125,118 @@ impl backend::KeyboardKeyEvent<LibinputInputBackend> for event::keyboard::Keyboa
     }
 }
 
-impl backend::Event<LibinputInputBackend> for event::pointer::PointerAxisEvent {
+impl backend::Event<LibinputInputBackend> for event::switch::SwitchToggleEvent {
     fn time(&self) -> u64 {
-        event::pointer::PointerEventTrait::time_usec(self)
+        event::switch::SwitchEventTrait::time_usec(self)
     }
 
-    fn device(&self) -> libinput::Device {
+    fn device(&self) -> <LibinputInputBackend as InputBackend>::Device {
         event::EventTrait::device(self)
     }
 }
 
-impl backend::PointerAxisEvent<LibinputInputBackend> for event::pointer::PointerAxisEvent {
+impl backend::SwitchToggleEvent<LibinputInputBackend> for event::switch::SwitchToggleEvent {
+    fn switch(&self) -> Option<backend::Switch> {
+        event::switch::SwitchToggleEvent::switch(self).and_then(|switch| {
+            Some(match switch {
+                event::switch::Switch::Lid => backend::Switch::Lid,
+                event::switch::Switch::TabletMode => backend::Switch::TabletMode,
+                _ => return None,
+            })
+        })
+    }
+
+    fn state(&self) -> backend::SwitchState {
+        match event::switch::SwitchToggleEvent::switch_state(self) {
+            event::switch::SwitchState::Off => backend::SwitchState::Off,
+            event::switch::SwitchState::On => backend::SwitchState::On,
+        }
+    }
+}
+
+/// Generic pointer scroll event from libinput
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub enum PointerScrollAxis {
+    /// Scroll event from pointer wheel
+    Wheel(event::pointer::PointerScrollWheelEvent),
+    /// Scroll event from pointer finger
+    Finger(event::pointer::PointerScrollFingerEvent),
+    /// Continuous scroll event
+    Continuous(event::pointer::PointerScrollContinuousEvent),
+}
+
+impl PointerScrollAxis {
+    fn has_axis(&self, axis: event::pointer::Axis) -> bool {
+        use input::event::pointer::PointerScrollEvent;
+        match self {
+            Self::Wheel(evt) => evt.has_axis(axis),
+            Self::Finger(evt) => evt.has_axis(axis),
+            Self::Continuous(evt) => evt.has_axis(axis),
+        }
+    }
+}
+
+impl backend::Event<LibinputInputBackend> for PointerScrollAxis {
+    fn time(&self) -> u64 {
+        match self {
+            Self::Wheel(evt) => event::pointer::PointerEventTrait::time_usec(evt),
+            Self::Finger(evt) => event::pointer::PointerEventTrait::time_usec(evt),
+            Self::Continuous(evt) => event::pointer::PointerEventTrait::time_usec(evt),
+        }
+    }
+
+    fn device(&self) -> libinput::Device {
+        match self {
+            Self::Wheel(evt) => event::EventTrait::device(evt),
+            Self::Finger(evt) => event::EventTrait::device(evt),
+            Self::Continuous(evt) => event::EventTrait::device(evt),
+        }
+    }
+}
+
+impl backend::PointerAxisEvent<LibinputInputBackend> for PointerScrollAxis {
     fn amount(&self, axis: Axis) -> Option<f64> {
+        use input::event::pointer::PointerScrollEvent;
         let axis = axis.into();
         if self.has_axis(axis) {
-            Some(self.axis_value(axis))
+            Some(match self {
+                Self::Wheel(evt) => evt.scroll_value(axis),
+                Self::Finger(evt) => evt.scroll_value(axis),
+                Self::Continuous(evt) => evt.scroll_value(axis),
+            })
         } else {
             None
         }
     }
 
-    fn amount_discrete(&self, axis: Axis) -> Option<f64> {
+    fn amount_v120(&self, axis: Axis) -> Option<f64> {
         let axis = axis.into();
         if self.has_axis(axis) {
-            self.axis_value_discrete(axis)
+            match self {
+                Self::Wheel(evt) => Some(evt.scroll_value_v120(axis)),
+                Self::Finger(_evt) => None,
+                Self::Continuous(_evt) => None,
+            }
         } else {
             None
         }
     }
 
-    fn source(&self) -> backend::AxisSource {
-        self.axis_source().into()
+    fn source(&self) -> AxisSource {
+        match self {
+            Self::Wheel(_) => AxisSource::Wheel,
+            Self::Finger(_) => AxisSource::Finger,
+            Self::Continuous(_) => AxisSource::Continuous,
+        }
+    }
+
+    fn relative_direction(&self, _axis: Axis) -> backend::AxisRelativeDirection {
+        let device = backend::Event::<LibinputInputBackend>::device(self);
+        if device.config_scroll_natural_scroll_enabled() {
+            AxisRelativeDirection::Inverted
+        } else {
+            AxisRelativeDirection::Identical
+        }
     }
 }
 
@@ -359,7 +435,6 @@ impl backend::Event<LibinputInputBackend> for event::gesture::GesturePinchEndEve
 
 impl backend::GesturePinchEndEvent<LibinputInputBackend> for event::gesture::GesturePinchEndEvent {}
 
-#[cfg(feature = "libinput_1_19")]
 impl backend::Event<LibinputInputBackend> for event::gesture::GestureHoldBeginEvent {
     fn time(&self) -> u64 {
         event::gesture::GestureEventTrait::time_usec(self)
@@ -370,10 +445,8 @@ impl backend::Event<LibinputInputBackend> for event::gesture::GestureHoldBeginEv
     }
 }
 
-#[cfg(feature = "libinput_1_19")]
 impl backend::GestureHoldBeginEvent<LibinputInputBackend> for event::gesture::GestureHoldBeginEvent {}
 
-#[cfg(feature = "libinput_1_19")]
 impl backend::Event<LibinputInputBackend> for event::gesture::GestureHoldEndEvent {
     fn time(&self) -> u64 {
         event::gesture::GestureEventTrait::time_usec(self)
@@ -384,7 +457,6 @@ impl backend::Event<LibinputInputBackend> for event::gesture::GestureHoldEndEven
     }
 }
 
-#[cfg(feature = "libinput_1_19")]
 impl backend::GestureHoldEndEvent<LibinputInputBackend> for event::gesture::GestureHoldEndEvent {}
 
 impl backend::Event<LibinputInputBackend> for event::touch::TouchDownEvent {
@@ -510,7 +582,7 @@ impl backend::TouchFrameEvent<LibinputInputBackend> for event::touch::TouchFrame
 impl InputBackend for LibinputInputBackend {
     type Device = libinput::Device;
     type KeyboardKeyEvent = event::keyboard::KeyboardKeyEvent;
-    type PointerAxisEvent = event::pointer::PointerAxisEvent;
+    type PointerAxisEvent = PointerScrollAxis;
     type PointerButtonEvent = event::pointer::PointerButtonEvent;
     type PointerMotionEvent = event::pointer::PointerMotionEvent;
     type PointerMotionAbsoluteEvent = event::pointer::PointerMotionAbsoluteEvent;
@@ -521,13 +593,7 @@ impl InputBackend for LibinputInputBackend {
     type GesturePinchBeginEvent = event::gesture::GesturePinchBeginEvent;
     type GesturePinchUpdateEvent = event::gesture::GesturePinchUpdateEvent;
     type GesturePinchEndEvent = event::gesture::GesturePinchEndEvent;
-    #[cfg(not(feature = "libinput_1_19"))]
-    type GestureHoldBeginEvent = backend::UnusedEvent;
-    #[cfg(not(feature = "libinput_1_19"))]
-    type GestureHoldEndEvent = backend::UnusedEvent;
-    #[cfg(feature = "libinput_1_19")]
     type GestureHoldBeginEvent = event::gesture::GestureHoldBeginEvent;
-    #[cfg(feature = "libinput_1_19")]
     type GestureHoldEndEvent = event::gesture::GestureHoldEndEvent;
 
     type TouchDownEvent = event::touch::TouchDownEvent;
@@ -539,6 +605,8 @@ impl InputBackend for LibinputInputBackend {
     type TabletToolProximityEvent = event::tablet_tool::TabletToolProximityEvent;
     type TabletToolTipEvent = event::tablet_tool::TabletToolTipEvent;
     type TabletToolButtonEvent = event::tablet_tool::TabletToolButtonEvent;
+
+    type SwitchToggleEvent = event::switch::SwitchToggleEvent;
 
     type SpecialEvent = backend::UnusedEvent;
 }
@@ -570,23 +638,28 @@ impl From<backend::Axis> for event::pointer::Axis {
     }
 }
 
-impl From<event::pointer::AxisSource> for backend::AxisSource {
-    fn from(libinput: event::pointer::AxisSource) -> Self {
-        match libinput {
-            event::pointer::AxisSource::Finger => backend::AxisSource::Finger,
-            event::pointer::AxisSource::Continuous => backend::AxisSource::Continuous,
-            event::pointer::AxisSource::Wheel => backend::AxisSource::Wheel,
-            event::pointer::AxisSource::WheelTilt => backend::AxisSource::WheelTilt,
-        }
-    }
-}
-
 impl From<event::pointer::ButtonState> for backend::ButtonState {
     fn from(libinput: event::pointer::ButtonState) -> Self {
         match libinput {
             event::pointer::ButtonState::Pressed => backend::ButtonState::Pressed,
             event::pointer::ButtonState::Released => backend::ButtonState::Released,
         }
+    }
+}
+
+impl From<crate::input::keyboard::LedState> for libinput::Led {
+    fn from(value: crate::input::keyboard::LedState) -> Self {
+        let mut leds = libinput::Led::empty();
+        if value.num.unwrap_or_default() {
+            leds |= libinput::Led::NUMLOCK;
+        }
+        if value.caps.unwrap_or_default() {
+            leds |= libinput::Led::CAPSLOCK;
+        }
+        if value.scroll.unwrap_or_default() {
+            leds |= libinput::Led::SCROLLLOCK;
+        }
+        leds
     }
 }
 
@@ -606,22 +679,20 @@ impl<S: Session> From<S> for LibinputSessionInterface<S> {
 #[cfg(feature = "backend_session")]
 impl<S: Session> libinput::LibinputInterface for LibinputSessionInterface<S> {
     fn open_restricted(&mut self, path: &Path, flags: i32) -> Result<OwnedFd, i32> {
-        use nix::fcntl::OFlag;
-        let fd = self
-            .0
-            .open(path, OFlag::from_bits_truncate(flags))
-            .map_err(|err| err.as_errno().unwrap_or(1 /*Use EPERM by default*/))?;
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        use rustix::fs::OFlags;
+        self.0
+            .open(path, OFlags::from_bits_truncate(flags as u32))
+            .map_err(|err| err.as_errno().unwrap_or(1 /*Use EPERM by default*/))
     }
 
     fn close_restricted(&mut self, fd: OwnedFd) {
-        let _ = self.0.close(fd.into_raw_fd());
+        let _ = self.0.close(fd);
     }
 }
 
-impl AsRawFd for LibinputInputBackend {
-    fn as_raw_fd(&self) -> RawFd {
-        self.context.as_raw_fd()
+impl AsFd for LibinputInputBackend {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.context.as_fd()
     }
 }
 
@@ -701,8 +772,29 @@ impl EventSource for LibinputInputBackend {
                                 &mut (),
                             );
                         }
-                        event::PointerEvent::Axis(axis_event) => {
-                            callback(InputEvent::PointerAxis { event: axis_event }, &mut ());
+                        event::PointerEvent::ScrollWheel(scroll_event) => {
+                            callback(
+                                InputEvent::PointerAxis {
+                                    event: PointerScrollAxis::Wheel(scroll_event),
+                                },
+                                &mut (),
+                            );
+                        }
+                        event::PointerEvent::ScrollFinger(scroll_event) => {
+                            callback(
+                                InputEvent::PointerAxis {
+                                    event: PointerScrollAxis::Finger(scroll_event),
+                                },
+                                &mut (),
+                            );
+                        }
+                        event::PointerEvent::ScrollContinuous(scroll_event) => {
+                            callback(
+                                InputEvent::PointerAxis {
+                                    event: PointerScrollAxis::Continuous(scroll_event),
+                                },
+                                &mut (),
+                            );
                         }
                         event::PointerEvent::Button(button_event) => {
                             callback(InputEvent::PointerButton { event: button_event }, &mut ());
@@ -730,11 +822,9 @@ impl EventSource for LibinputInputBackend {
                         event::GestureEvent::Pinch(event::gesture::GesturePinchEvent::End(event)) => {
                             callback(InputEvent::GesturePinchEnd { event }, &mut ());
                         }
-                        #[cfg(feature = "libinput_1_19")]
                         event::GestureEvent::Hold(event::gesture::GestureHoldEvent::Begin(event)) => {
                             callback(InputEvent::GestureHoldBegin { event }, &mut ());
                         }
-                        #[cfg(feature = "libinput_1_19")]
                         event::GestureEvent::Hold(event::gesture::GestureHoldEvent::End(event)) => {
                             callback(InputEvent::GestureHoldEnd { event }, &mut ());
                         }
@@ -759,6 +849,14 @@ impl EventSource for LibinputInputBackend {
                             trace!("Unknown libinput tablet event");
                         }
                     },
+                    libinput::Event::Switch(switch_event) => match switch_event {
+                        event::SwitchEvent::Toggle(event) => {
+                            callback(InputEvent::SwitchToggle { event }, &mut ());
+                        }
+                        _ => {
+                            trace!("Unknown libinput switch event");
+                        }
+                    },
                     _ => {} //FIXME: What to do with the rest.
                 }
             }
@@ -769,16 +867,17 @@ impl EventSource for LibinputInputBackend {
 
     fn register(&mut self, poll: &mut Poll, factory: &mut TokenFactory) -> calloop::Result<()> {
         self.token = Some(factory.token());
-        poll.register(self.as_raw_fd(), Interest::READ, Mode::Level, self.token.unwrap())
+        // Safety: the FD cannot be closed without removing the LibinputInputBackend from the event loop
+        unsafe { poll.register(self.as_fd(), Interest::READ, Mode::Level, self.token.unwrap()) }
     }
 
     fn reregister(&mut self, poll: &mut Poll, factory: &mut TokenFactory) -> calloop::Result<()> {
         self.token = Some(factory.token());
-        poll.reregister(self.as_raw_fd(), Interest::READ, Mode::Level, self.token.unwrap())
+        poll.reregister(self.as_fd(), Interest::READ, Mode::Level, self.token.unwrap())
     }
 
     fn unregister(&mut self, poll: &mut Poll) -> calloop::Result<()> {
         self.token = None;
-        poll.unregister(self.as_raw_fd())
+        poll.unregister(self.as_fd())
     }
 }

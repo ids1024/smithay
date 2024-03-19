@@ -1,6 +1,22 @@
 use crate::backend::SwapBuffersError;
 use drm::control::{connector, crtc, plane, Mode, RawResourceHandle};
-use std::path::PathBuf;
+use std::{
+    io::{self, ErrorKind},
+    path::PathBuf,
+};
+
+/// DRM access error
+#[derive(Debug, thiserror::Error)]
+#[error("DRM access error: {errmsg} on device `{dev:?}` ({source:})")]
+pub struct AccessError {
+    /// Error message associated to the access error
+    pub(crate) errmsg: &'static str,
+    /// Device on which the error was generated
+    pub(crate) dev: Option<PathBuf>,
+    /// Underlying device error
+    #[source]
+    pub source: io::Error,
+}
 
 /// Errors thrown by the [`DrmDevice`](crate::backend::drm::DrmDevice)
 /// and the [`DrmSurface`](crate::backend::drm::DrmSurface).
@@ -10,18 +26,11 @@ pub enum Error {
     #[error("Failed to aquire DRM master")]
     DrmMasterFailed,
     /// The `DrmDevice` encountered an access error
-    #[error("DRM access error: {errmsg} on device `{dev:?}` ({source:})")]
-    Access {
-        /// Error message associated to the access error
-        errmsg: &'static str,
-        /// Device on which the error was generated
-        dev: Option<PathBuf>,
-        /// Underlying device error
-        source: drm::SystemError,
-    },
+    #[error(transparent)]
+    Access(#[from] AccessError),
     /// Unable to determine device id of drm device
     #[error("Unable to determine device id of drm device")]
-    UnableToGetDeviceId(#[source] nix::Error),
+    UnableToGetDeviceId(#[source] rustix::io::Errno),
     /// Device is currently paused
     #[error("Device is currently paused, operation rejected")]
     DeviceInactive,
@@ -74,20 +83,18 @@ impl From<Error> for SwapBuffersError {
     fn from(err: Error) -> SwapBuffersError {
         match err {
             x @ Error::DeviceInactive => SwapBuffersError::TemporaryFailure(Box::new(x)),
-            Error::Access {
+            Error::Access(AccessError {
                 errmsg, dev, source, ..
-            } if matches!(
-                source,
-                drm::SystemError::PermissionDenied
-                    | drm::SystemError::Unknown {
-                        errno: nix::errno::Errno::EBUSY,
-                    }
-                    | drm::SystemError::Unknown {
-                        errno: nix::errno::Errno::EINTR,
-                    }
+            }) if matches!(
+                source.kind(),
+                ErrorKind::PermissionDenied | ErrorKind::WouldBlock | ErrorKind::Interrupted
             ) =>
             {
-                SwapBuffersError::TemporaryFailure(Box::new(Error::Access { errmsg, dev, source }))
+                SwapBuffersError::TemporaryFailure(Box::new(Error::Access(AccessError {
+                    errmsg,
+                    dev,
+                    source,
+                })))
             }
             x => SwapBuffersError::ContextLost(Box::new(x)),
         }

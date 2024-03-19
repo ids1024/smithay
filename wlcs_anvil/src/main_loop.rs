@@ -7,7 +7,7 @@ use std::{
 use smithay::{
     backend::{
         input::ButtonState,
-        renderer::{damage::OutputDamageTracker, element::AsRenderElements},
+        renderer::{damage::OutputDamageTracker, element::AsRenderElements, test::DummyRenderer},
     },
     input::pointer::{
         ButtonEvent, CursorImageAttributes, CursorImageStatus, MotionEvent, RelativeMotionEvent,
@@ -18,17 +18,17 @@ use smithay::{
             channel::{Channel, Event as ChannelEvent},
             EventLoop,
         },
-        wayland_server::{protocol::wl_surface, Client, Display, Resource},
+        wayland_server::{protocol::wl_surface, Client, Display, DisplayHandle, Resource},
     },
-    utils::{IsAlive, Point, Scale, SERIAL_COUNTER as SCOUNTER},
-    wayland::{compositor, input_method::InputMethodSeat},
+    utils::{IsAlive, Scale, SERIAL_COUNTER as SCOUNTER},
+    wayland::compositor,
 };
 
 use anvil::{drawing::PointerElement, render::*, state::Backend, AnvilState, CalloopData, ClientState};
 
-use crate::{renderer::DummyRenderer, WlcsEvent};
+use crate::WlcsEvent;
 
-pub const OUTPUT_NAME: &str = "anvil";
+const OUTPUT_NAME: &str = "anvil";
 
 struct TestState {
     clients: HashMap<i32, Client>,
@@ -41,30 +41,31 @@ impl Backend for TestState {
 
     fn reset_buffers(&mut self, _output: &Output) {}
     fn early_import(&mut self, _surface: &wl_surface::WlSurface) {}
+    fn update_led_state(&mut self, led_state: smithay::input::keyboard::LedState) {}
 }
 
 pub fn run(channel: Channel<WlcsEvent>) {
     let mut event_loop =
         EventLoop::<CalloopData<TestState>>::try_new().expect("Failed to init the event loop.");
 
-    let mut display = Display::new().expect("Failed to init display");
-    let dh = display.handle();
+    let display = Display::new().expect("Failed to init display");
+    let mut display_handle = display.handle();
 
     let test_state = TestState {
         clients: HashMap::new(),
     };
 
-    let mut state = AnvilState::init(&mut display, event_loop.handle(), test_state, false);
+    let mut state = AnvilState::init(display, event_loop.handle(), test_state, false);
 
     event_loop
         .handle()
         .insert_source(channel, move |event, &mut (), data| match event {
-            ChannelEvent::Msg(evt) => handle_event(evt, &mut data.state, &mut data.display),
-            ChannelEvent::Closed => handle_event(WlcsEvent::Exit, &mut data.state, &mut data.display),
+            ChannelEvent::Msg(evt) => handle_event(evt, &mut data.state, &mut data.display_handle),
+            ChannelEvent::Closed => handle_event(WlcsEvent::Exit, &mut data.state, &mut data.display_handle),
         })
         .unwrap();
 
-    let mut renderer = crate::renderer::DummyRenderer::new();
+    let mut renderer = DummyRenderer::new();
 
     let mode = Mode {
         size: (800, 600).into(),
@@ -80,7 +81,7 @@ pub fn run(channel: Channel<WlcsEvent>) {
             model: "WLCS".into(),
         },
     );
-    let _global = output.create_global::<AnvilState<TestState>>(&dh);
+    let _global = output.create_global::<AnvilState<TestState>>(&display_handle);
     output.change_current_state(Some(mode), None, None, Some((0, 0).into()));
     output.set_preferred(mode);
     state.space.map_output(&output, (0, 0));
@@ -95,23 +96,6 @@ pub fn run(channel: Channel<WlcsEvent>) {
             let mut cursor_guard = state.cursor_status.lock().unwrap();
             let mut elements: Vec<CustomRenderElements<_>> = Vec::new();
 
-            // draw input method square if any
-            let input_method = state.seat.input_method();
-            let rectangle = input_method.coordinates();
-            let position = Point::from((
-                rectangle.loc.x + rectangle.size.w,
-                rectangle.loc.y + rectangle.size.h,
-            ));
-            input_method.with_surface(|surface| {
-                elements.extend(AsRenderElements::<DummyRenderer>::render_elements(
-                    &smithay::desktop::space::SurfaceTree::from_surface(surface),
-                    &mut renderer,
-                    position.to_physical_precise_round(scale),
-                    scale,
-                    1.0,
-                ));
-            });
-
             // draw the cursor as relevant
             // reset the cursor if the surface is no longer alive
             let mut reset = false;
@@ -119,7 +103,7 @@ pub fn run(channel: Channel<WlcsEvent>) {
                 reset = !surface.alive();
             }
             if reset {
-                *cursor_guard = CursorImageStatus::Default;
+                *cursor_guard = CursorImageStatus::default_named();
             }
 
             let cursor_hotspot = if let CursorImageStatus::Surface(ref surface) = *cursor_guard {
@@ -172,30 +156,31 @@ pub fn run(channel: Channel<WlcsEvent>) {
             })
         });
 
-        let mut calloop_data = CalloopData { state, display };
+        let mut calloop_data = CalloopData {
+            state,
+            display_handle,
+        };
         let result = event_loop.dispatch(Some(Duration::from_millis(16)), &mut calloop_data);
-        CalloopData { state, display } = calloop_data;
+        CalloopData {
+            state,
+            display_handle,
+        } = calloop_data;
 
         if result.is_err() {
             state.running.store(false, Ordering::SeqCst);
         } else {
             state.space.refresh();
             state.popups.cleanup();
-            display.flush_clients().unwrap();
+            display_handle.flush_clients().unwrap();
         }
     }
 }
 
-fn handle_event(
-    event: WlcsEvent,
-    state: &mut AnvilState<TestState>,
-    display: &mut Display<AnvilState<TestState>>,
-) {
+fn handle_event(event: WlcsEvent, state: &mut AnvilState<TestState>, display_handle: &mut DisplayHandle) {
     match event {
         WlcsEvent::Exit => state.running.store(false, Ordering::SeqCst),
         WlcsEvent::NewClient { stream, client_id } => {
-            let client = display
-                .handle()
+            let client = display_handle
                 .insert_client(stream, Arc::new(ClientState::default()))
                 .expect("Failed to insert client");
             state.backend_data.clients.insert(client_id, client);
@@ -209,7 +194,7 @@ fn handle_event(
             let client = state.backend_data.clients.get(&client_id);
             let toplevel = state.space.elements().find(|w| {
                 if let Some(surface) = w.wl_surface() {
-                    display.handle().get_client(surface.id()).ok().as_ref() == client
+                    display_handle.get_client(surface.id()).ok().as_ref() == client
                         && surface.id().protocol_id() == surface_id
                 } else {
                     false
@@ -236,6 +221,7 @@ fn handle_event(
                     time,
                 },
             );
+            ptr.frame(state);
         }
         WlcsEvent::PointerMoveRelative { delta, .. } => {
             let pointer_location = state.pointer.current_location() + delta;
@@ -261,15 +247,16 @@ fn handle_event(
                     delta_unaccel: delta,
                     utime,
                 },
-            )
+            );
+            ptr.frame(state);
         }
         WlcsEvent::PointerButtonDown { button_id, .. } => {
             let serial = SCOUNTER.next_serial();
-            let pointer = state.seat.get_pointer().unwrap();
-            if !pointer.is_grabbed() {
+            let ptr = state.seat.get_pointer().unwrap();
+            if !ptr.is_grabbed() {
                 let under = state
                     .space
-                    .element_under(pointer.current_location())
+                    .element_under(ptr.current_location())
                     .map(|(w, _)| w.clone());
                 if let Some(window) = under.as_ref() {
                     state.space.raise_element(window, true);
@@ -281,7 +268,7 @@ fn handle_event(
                     .set_focus(state, under.map(Into::into), serial);
             }
             let time = Duration::from(state.clock.now()).as_millis() as u32;
-            pointer.button(
+            ptr.button(
                 state,
                 &ButtonEvent {
                     button: button_id as u32,
@@ -290,11 +277,13 @@ fn handle_event(
                     time,
                 },
             );
+            ptr.frame(state);
         }
         WlcsEvent::PointerButtonUp { button_id, .. } => {
             let serial = SCOUNTER.next_serial();
             let time = Duration::from(state.clock.now()).as_millis() as u32;
-            state.seat.get_pointer().unwrap().button(
+            let ptr = state.seat.get_pointer().unwrap();
+            ptr.button(
                 state,
                 &ButtonEvent {
                     button: button_id as u32,
@@ -303,6 +292,7 @@ fn handle_event(
                     time,
                 },
             );
+            ptr.frame(state);
         }
         WlcsEvent::PointerRemoved { .. } => {}
         // touch inputs

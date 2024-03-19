@@ -58,7 +58,7 @@ impl PointerGrab<Smallvil> for MoveSurfaceGrab {
 
         if !handle.current_pressed().contains(&BTN_LEFT) {
             // No more buttons are pressed, release the grab.
-            handle.unset_grab(data, event.serial, event.time);
+            handle.unset_grab(data, event.serial, event.time, true);
         }
     }
 
@@ -69,6 +69,10 @@ impl PointerGrab<Smallvil> for MoveSurfaceGrab {
         details: AxisFrame,
     ) {
         handle.axis(data, details)
+    }
+
+    fn frame(&mut self, data: &mut Smallvil, handle: &mut PointerInnerHandle<'_, Smallvil>) {
+        handle.frame(data);
     }
 
     fn gesture_swipe_begin(

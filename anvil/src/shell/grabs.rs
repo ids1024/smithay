@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 
 use smithay::{
-    desktop::space::SpaceElement,
+    desktop::{space::SpaceElement, WindowSurface},
     input::pointer::{
         AxisFrame, ButtonEvent, GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent,
         GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
@@ -64,7 +64,7 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for MoveSurfaceG
         handle.button(data, event);
         if handle.current_pressed().is_empty() {
             // No more buttons are pressed, release the grab.
-            handle.unset_grab(data, event.serial, event.time);
+            handle.unset_grab(data, event.serial, event.time, true);
         }
     }
 
@@ -75,6 +75,14 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for MoveSurfaceG
         details: AxisFrame,
     ) {
         handle.axis(data, details)
+    }
+
+    fn frame(
+        &mut self,
+        data: &mut AnvilState<BackendData>,
+        handle: &mut PointerInnerHandle<'_, AnvilState<BackendData>>,
+    ) {
+        handle.frame(data);
     }
 
     fn gesture_swipe_begin(
@@ -246,7 +254,7 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for ResizeSurfac
 
         // It is impossible to get `min_size` and `max_size` of dead toplevel, so we return early.
         if !self.window.alive() {
-            handle.unset_grab(data, event.serial, event.time);
+            handle.unset_grab(data, event.serial, event.time, true);
             return;
         }
 
@@ -301,9 +309,8 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for ResizeSurfac
 
         self.last_window_size = (new_window_width, new_window_height).into();
 
-        match &self.window {
-            WindowElement::Wayland(w) => {
-                let xdg = w.toplevel();
+        match &self.window.0.underlying_surface() {
+            WindowSurface::Wayland(xdg) => {
                 xdg.with_pending_state(|state| {
                     state.states.set(xdg_toplevel::State::Resizing);
                     state.size = Some(self.last_window_size);
@@ -311,7 +318,7 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for ResizeSurfac
                 xdg.send_pending_configure();
             }
             #[cfg(feature = "xwayland")]
-            WindowElement::X11(x11) => {
+            WindowSurface::X11(x11) => {
                 let location = data.space.element_location(&self.window).unwrap();
                 x11.configure(Rectangle::from_loc_and_size(location, self.last_window_size))
                     .unwrap();
@@ -338,16 +345,15 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for ResizeSurfac
         handle.button(data, event);
         if handle.current_pressed().is_empty() {
             // No more buttons are pressed, release the grab.
-            handle.unset_grab(data, event.serial, event.time);
+            handle.unset_grab(data, event.serial, event.time, true);
 
             // If toplevel is dead, we can't resize it, so we return early.
             if !self.window.alive() {
                 return;
             }
 
-            match &self.window {
-                WindowElement::Wayland(w) => {
-                    let xdg = w.toplevel();
+            match &self.window.0.underlying_surface() {
+                WindowSurface::Wayland(xdg) => {
                     xdg.with_pending_state(|state| {
                         state.states.unset(xdg_toplevel::State::Resizing);
                         state.size = Some(self.last_window_size);
@@ -383,7 +389,7 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for ResizeSurfac
                     });
                 }
                 #[cfg(feature = "xwayland")]
-                WindowElement::X11(x11) => {
+                WindowSurface::X11(x11) => {
                     let mut location = data.space.element_location(&self.window).unwrap();
                     if self.edges.intersects(ResizeEdge::TOP_LEFT) {
                         let geometry = self.window.geometry();
@@ -430,6 +436,14 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for ResizeSurfac
         details: AxisFrame,
     ) {
         handle.axis(data, details)
+    }
+
+    fn frame(
+        &mut self,
+        data: &mut AnvilState<BackendData>,
+        handle: &mut PointerInnerHandle<'_, AnvilState<BackendData>>,
+    ) {
+        handle.frame(data);
     }
 
     fn gesture_swipe_begin(

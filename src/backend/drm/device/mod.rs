@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io;
-use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd};
+use std::os::unix::io::{AsFd, BorrowedFd};
 use std::sync::atomic::Ordering;
 use std::sync::{atomic::AtomicBool, Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 use calloop::{EventSource, Interest, Poll, PostAction, Readiness, Token, TokenFactory};
 use drm::control::{connector, crtc, plane, Device as ControlDevice, Event, Mode, ResourceHandles};
 use drm::{ClientCapability, Device as BasicDevice, DriverCapability};
-use nix::libc::dev_t;
+use libc::dev_t;
 
 pub(super) mod atomic;
 mod fd;
@@ -16,6 +16,7 @@ pub use self::fd::DrmDeviceFd;
 pub(super) mod legacy;
 use crate::utils::{Buffer, DevPath, Size};
 
+use super::error::AccessError;
 use super::surface::{atomic::AtomicDrmSurface, legacy::LegacyDrmSurface, DrmSurface, DrmSurfaceInternal};
 use super::{error::Error, planes, Planes};
 use atomic::AtomicDrmDevice;
@@ -115,6 +116,7 @@ pub struct DrmDevice {
     cursor_size: Size<u32, Buffer>,
     resources: ResourceHandles,
     plane_claim_storage: PlaneClaimStorage,
+    surfaces: Vec<Weak<DrmSurfaceInternal>>,
 }
 
 impl AsFd for DrmDevice {
@@ -207,10 +209,12 @@ impl DrmDevice {
             .get_driver_capability(DriverCapability::CursorHeight)
             .unwrap_or(64);
         let cursor_size = Size::from((cursor_width as u32, cursor_height as u32));
-        let resources = fd.resource_handles().map_err(|source| Error::Access {
-            errmsg: "Error loading resource handles",
-            dev: fd.dev_path(),
-            source,
+        let resources = fd.resource_handles().map_err(|source| {
+            Error::Access(AccessError {
+                errmsg: "Error loading resource handles",
+                dev: fd.dev_path(),
+                source,
+            })
         })?;
 
         let internal = Arc::new(DrmDevice::create_internal(fd, active, disable_connectors)?);
@@ -223,6 +227,7 @@ impl DrmDevice {
                 cursor_size,
                 resources,
                 plane_claim_storage: Default::default(),
+                surfaces: Default::default(),
             },
             DrmDeviceNotifier {
                 internal,
@@ -307,11 +312,13 @@ impl DrmDevice {
     ///     attached to a crtc in smithay.
     #[instrument(skip(self), parent = self.internal.span(), err)]
     pub fn create_surface(
-        &self,
+        &mut self,
         crtc: crtc::Handle,
         mode: Mode,
         connectors: &[connector::Handle],
     ) -> Result<DrmSurface, Error> {
+        self.surfaces.retain(|surface| surface.upgrade().is_some());
+
         if connectors.is_empty() {
             return Err(Error::SurfaceWithoutConnectors(crtc));
         }
@@ -321,13 +328,13 @@ impl DrmDevice {
         }
 
         let planes = self.planes(&crtc)?;
-        let info = self
-            .get_plane(planes.primary.handle)
-            .map_err(|source| Error::Access {
+        let info = self.get_plane(planes.primary.handle).map_err(|source| {
+            Error::Access(AccessError {
                 errmsg: "Failed to get plane info",
                 dev: self.dev_path(),
                 source,
-            })?;
+            })
+        })?;
         let filter = info.possible_crtcs();
         if !self.resources.filter_crtcs(filter).contains(&crtc) {
             return Err(Error::PlaneNotCompatible(crtc, planes.primary.handle));
@@ -362,12 +369,14 @@ impl DrmDevice {
                 connectors,
             )?)
         };
+        let internal = Arc::new(internal);
+        self.surfaces.push(Arc::downgrade(&internal));
 
         Ok(DrmSurface {
             dev_id: self.dev_id,
             crtc,
             planes,
-            internal: Arc::new(internal),
+            internal,
             plane_claim_storage: self.plane_claim_storage.clone(),
         })
     }
@@ -387,8 +396,9 @@ impl DrmDevice {
     /// This will cause the `DrmDevice` to avoid making calls to the file descriptor e.g. on drop.
     /// Note that calls directly utilizing the underlying file descriptor, like the traits of the `drm-rs` crate,
     /// will ignore this state. Use [`DrmDevice::is_active`] to guard these calls.
-    pub fn pause(&self) {
+    pub fn pause(&mut self) {
         self.set_active(false);
+        self.surfaces.retain(|surface| surface.upgrade().is_some());
         if self.device_fd().is_privileged() {
             if let Err(err) = self.release_master_lock() {
                 error!("Failed to drop drm master state Error: {}", err);
@@ -396,14 +406,24 @@ impl DrmDevice {
         }
     }
 
-    /// Actives a previously paused device.
-    pub fn activate(&self) {
+    /// Activates a previously paused device.
+    ///
+    /// Specifying `true` for `disable_connectors` will call [`DrmDevice::reset_state`] if
+    /// the device was not active before. Otherwise you need to make sure there are no
+    /// conflicting requirements when enabling or creating surfaces or you are prepared
+    /// to handle errors caused by those.
+    pub fn activate(&mut self, disable_connectors: bool) -> Result<(), Error> {
         if self.device_fd().is_privileged() {
             if let Err(err) = self.acquire_master_lock() {
                 error!("Failed to acquire drm master again. Error: {}", err);
             }
         }
-        self.set_active(true);
+        if !self.set_active(true) && disable_connectors {
+            self.reset_state()
+        } else {
+            self.surfaces.retain(|surface| surface.upgrade().is_some());
+            Ok(())
+        }
     }
 
     /// Returns if the device is currently paused or not.
@@ -414,10 +434,39 @@ impl DrmDevice {
         }
     }
 
-    fn set_active(&self, active: bool) {
+    /// Reset the state of this device
+    ///
+    /// This will disable all connectors and reset all planes.
+    /// Additional this will also reset the state on all known surfaces.
+    pub fn reset_state(&mut self) -> Result<(), Error> {
+        if !self.is_active() {
+            return Err(Error::DeviceInactive);
+        }
+
         match &*self.internal {
-            DrmDeviceInternal::Atomic(internal) => internal.active.store(active, Ordering::SeqCst),
-            DrmDeviceInternal::Legacy(internal) => internal.active.store(active, Ordering::SeqCst),
+            DrmDeviceInternal::Atomic(internal) => internal.reset_state(),
+            DrmDeviceInternal::Legacy(internal) => internal.reset_state(),
+        }?;
+
+        let mut i = 0;
+        while i != self.surfaces.len() {
+            if let Some(surface) = self.surfaces[i].upgrade() {
+                match &*surface {
+                    DrmSurfaceInternal::Atomic(surf) => surf.reset_state::<Self>(None),
+                    DrmSurfaceInternal::Legacy(surf) => surf.reset_state::<Self>(None),
+                }?;
+                i += 1;
+            } else {
+                self.surfaces.remove(i);
+            }
+        }
+        Ok(())
+    }
+
+    fn set_active(&self, active: bool) -> bool {
+        match &*self.internal {
+            DrmDeviceInternal::Atomic(internal) => internal.active.swap(active, Ordering::SeqCst),
+            DrmDeviceInternal::Legacy(internal) => internal.active.swap(active, Ordering::SeqCst),
         }
     }
 }
@@ -432,7 +481,7 @@ pub enum DrmEvent {
 }
 
 /// Timing metadata for page-flip events
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct EventMetadata {
     /// The time the frame flip happend
     pub time: Time,
@@ -441,7 +490,7 @@ pub struct EventMetadata {
 }
 
 /// Either a realtime or monotonic timestamp
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Time {
     /// Monotonic time stamp
     Monotonic(Duration),
@@ -497,11 +546,11 @@ impl EventSource for DrmDeviceNotifier {
             }
             Err(source) => {
                 callback(
-                    DrmEvent::Error(Error::Access {
+                    DrmEvent::Error(Error::Access(AccessError {
                         errmsg: "Error processing drm events",
                         dev: self.internal.dev_path(),
                         source,
-                    }),
+                    })),
                     &mut None,
                 );
             }
@@ -511,18 +560,21 @@ impl EventSource for DrmDeviceNotifier {
 
     fn register(&mut self, poll: &mut Poll, factory: &mut TokenFactory) -> calloop::Result<()> {
         self.token = Some(factory.token());
-        poll.register(
-            self.internal.as_fd().as_raw_fd(),
-            Interest::READ,
-            calloop::Mode::Level,
-            self.token.unwrap(),
-        )
+        // Safety: the FD cannot be closed without removing the DrmDeviceNotifier from the event loop
+        unsafe {
+            poll.register(
+                self.internal.as_fd(),
+                Interest::READ,
+                calloop::Mode::Level,
+                self.token.unwrap(),
+            )
+        }
     }
 
     fn reregister(&mut self, poll: &mut Poll, factory: &mut TokenFactory) -> calloop::Result<()> {
         self.token = Some(factory.token());
         poll.reregister(
-            self.internal.as_fd().as_raw_fd(),
+            self.internal.as_fd(),
             Interest::READ,
             calloop::Mode::Level,
             self.token.unwrap(),
@@ -531,6 +583,6 @@ impl EventSource for DrmDeviceNotifier {
 
     fn unregister(&mut self, poll: &mut Poll) -> calloop::Result<()> {
         self.token = None;
-        poll.unregister(self.internal.as_fd().as_raw_fd())
+        poll.unregister(self.internal.as_fd())
     }
 }

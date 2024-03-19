@@ -1,5 +1,5 @@
 use std::{
-    os::unix::io::{AsRawFd, OwnedFd},
+    os::unix::io::OwnedFd,
     sync::{atomic::AtomicBool, Arc, Mutex},
     time::Duration,
 };
@@ -10,21 +10,22 @@ use smithay::{
     backend::renderer::element::{
         default_primary_scanout_output_compare, utils::select_dmabuf_feedback, RenderElementStates,
     },
-    delegate_compositor, delegate_data_device, delegate_fractional_scale, delegate_input_method_manager,
-    delegate_keyboard_shortcuts_inhibit, delegate_layer_shell, delegate_output, delegate_pointer_gestures,
-    delegate_presentation, delegate_primary_selection, delegate_relative_pointer, delegate_seat,
-    delegate_security_context, delegate_shm, delegate_tablet_manager, delegate_text_input_manager,
-    delegate_viewporter, delegate_virtual_keyboard_manager, delegate_xdg_activation, delegate_xdg_decoration,
-    delegate_xdg_shell,
+    delegate_compositor, delegate_data_control, delegate_data_device, delegate_fractional_scale,
+    delegate_input_method_manager, delegate_keyboard_shortcuts_inhibit, delegate_layer_shell,
+    delegate_output, delegate_pointer_constraints, delegate_pointer_gestures, delegate_presentation,
+    delegate_primary_selection, delegate_relative_pointer, delegate_seat, delegate_security_context,
+    delegate_shm, delegate_tablet_manager, delegate_text_input_manager, delegate_viewporter,
+    delegate_virtual_keyboard_manager, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{
+        space::SpaceElement,
         utils::{
             surface_presentation_feedback_flags_from_states, surface_primary_scanout_output,
             update_surface_primary_scanout_output, OutputPresentationFeedback,
         },
-        PopupManager, Space,
+        PopupKind, PopupManager, Space,
     },
     input::{
-        keyboard::XkbConfig,
+        keyboard::{Keysym, LedState, XkbConfig},
         pointer::{CursorImageStatus, PointerHandle},
         Seat, SeatHandler, SeatState,
     },
@@ -40,27 +41,32 @@ use smithay::{
             Display, DisplayHandle, Resource,
         },
     },
-    utils::{Clock, Monotonic},
+    utils::{Clock, Monotonic, Rectangle},
     wayland::{
         compositor::{get_parent, with_states, CompositorClientState, CompositorState},
-        data_device::{
-            set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState,
-            ServerDndGrabHandler,
-        },
         dmabuf::DmabufFeedback,
         fractional_scale::{with_fractional_scale, FractionalScaleHandler, FractionalScaleManagerState},
-        input_method::InputMethodManagerState,
+        input_method::{InputMethodHandler, InputMethodManagerState, PopupSurface},
         keyboard_shortcuts_inhibit::{
             KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState, KeyboardShortcutsInhibitor,
         },
-        output::OutputManagerState,
+        output::{OutputHandler, OutputManagerState},
+        pointer_constraints::{with_pointer_constraint, PointerConstraintsHandler, PointerConstraintsState},
         pointer_gestures::PointerGesturesState,
         presentation::PresentationState,
-        primary_selection::{set_primary_focus, PrimarySelectionHandler, PrimarySelectionState},
         relative_pointer::RelativePointerManagerState,
         seat::WaylandFocus,
         security_context::{
             SecurityContext, SecurityContextHandler, SecurityContextListenerSource, SecurityContextState,
+        },
+        selection::data_device::{
+            set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState,
+            ServerDndGrabHandler,
+        },
+        selection::{
+            primary_selection::{set_primary_focus, PrimarySelectionHandler, PrimarySelectionState},
+            wlr_data_control::{DataControlHandler, DataControlState},
+            SelectionHandler,
         },
         shell::{
             wlr_layer::WlrLayerShellState,
@@ -71,7 +77,7 @@ use smithay::{
         },
         shm::{ShmHandler, ShmState},
         socket::ListeningSocketSource,
-        tablet_manager::TabletSeatTrait,
+        tablet_manager::{TabletManagerState, TabletSeatTrait},
         text_input::TextInputManagerState,
         viewporter::ViewporterState,
         virtual_keyboard::VirtualKeyboardManagerState,
@@ -87,19 +93,15 @@ use crate::{focus::FocusTarget, shell::WindowElement};
 #[cfg(feature = "xwayland")]
 use smithay::{
     delegate_xwayland_keyboard_grab,
-    reexports::wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
     utils::{Point, Size},
-    wayland::{
-        data_device::with_source_metadata as with_data_device_source_metadata,
-        primary_selection::with_source_metadata as with_primary_source_metadata,
-        xwayland_keyboard_grab::{XWaylandKeyboardGrabHandler, XWaylandKeyboardGrabState},
-    },
-    xwayland::{xwm::SelectionType, X11Wm, XWayland, XWaylandEvent},
+    wayland::selection::{SelectionSource, SelectionTarget},
+    wayland::xwayland_keyboard_grab::{XWaylandKeyboardGrabHandler, XWaylandKeyboardGrabState},
+    xwayland::{X11Wm, XWayland, XWaylandEvent},
 };
 
 pub struct CalloopData<BackendData: Backend + 'static> {
     pub state: AnvilState<BackendData>,
-    pub display: Display<AnvilState<BackendData>>,
+    pub display_handle: DisplayHandle,
 }
 
 #[derive(Debug, Default)]
@@ -132,6 +134,7 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub layer_shell_state: WlrLayerShellState,
     pub output_manager_state: OutputManagerState,
     pub primary_selection_state: PrimarySelectionState,
+    pub data_control_state: DataControlState,
     pub seat_state: SeatState<AnvilState<BackendData>>,
     pub keyboard_shortcuts_inhibit_state: KeyboardShortcutsInhibitState,
     pub shm_state: ShmState,
@@ -145,7 +148,7 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub dnd_icon: Option<WlSurface>,
 
     // input-related fields
-    pub suppressed_keys: Vec<u32>,
+    pub suppressed_keys: Vec<Keysym>,
     pub cursor_status: Arc<Mutex<CursorImageStatus>>,
     pub seat_name: String,
     pub seat: Seat<AnvilState<BackendData>>,
@@ -168,37 +171,11 @@ pub struct AnvilState<BackendData: Backend + 'static> {
 delegate_compositor!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
 impl<BackendData: Backend> DataDeviceHandler for AnvilState<BackendData> {
-    type SelectionUserData = ();
-
     fn data_device_state(&self) -> &DataDeviceState {
         &self.data_device_state
     }
-
-    #[cfg(feature = "xwayland")]
-    fn new_selection(&mut self, source: Option<WlDataSource>, _seat: Seat<Self>) {
-        if let Some(xwm) = self.xwm.as_mut() {
-            if let Some(source) = source {
-                if let Ok(Err(err)) = with_data_device_source_metadata(&source, |metadata| {
-                    xwm.new_selection(SelectionType::Clipboard, Some(metadata.mime_types.clone()))
-                }) {
-                    warn!(?err, "Failed to set Xwayland clipboard selection");
-                }
-            } else if let Err(err) = xwm.new_selection(SelectionType::Clipboard, None) {
-                warn!(?err, "Failed to clear Xwayland clipboard selection");
-            }
-        }
-    }
-
-    #[cfg(feature = "xwayland")]
-    fn send_selection(&mut self, mime_type: String, fd: OwnedFd, _seat: Seat<Self>, _user_data: &()) {
-        if let Some(xwm) = self.xwm.as_mut() {
-            if let Err(err) = xwm.send_selection(SelectionType::Clipboard, mime_type, fd, self.handle.clone())
-            {
-                warn!(?err, "Failed to send clipboard (X11 -> Wayland)");
-            }
-        }
-    }
 }
+
 impl<BackendData: Backend> ClientDndGrabHandler for AnvilState<BackendData> {
     fn started(&mut self, _source: Option<WlDataSource>, icon: Option<WlSurface>, _seat: Seat<Self>) {
         self.dnd_icon = icon;
@@ -214,39 +191,52 @@ impl<BackendData: Backend> ServerDndGrabHandler for AnvilState<BackendData> {
 }
 delegate_data_device!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
+impl<BackendData: Backend> OutputHandler for AnvilState<BackendData> {}
 delegate_output!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
-impl<BackendData: Backend> PrimarySelectionHandler for AnvilState<BackendData> {
+impl<BackendData: Backend> SelectionHandler for AnvilState<BackendData> {
     type SelectionUserData = ();
-    fn primary_selection_state(&self) -> &PrimarySelectionState {
-        &self.primary_selection_state
-    }
 
     #[cfg(feature = "xwayland")]
-    fn new_selection(&mut self, source: Option<ZwpPrimarySelectionSourceV1>, _seat: Seat<Self>) {
+    fn new_selection(&mut self, ty: SelectionTarget, source: Option<SelectionSource>, _seat: Seat<Self>) {
         if let Some(xwm) = self.xwm.as_mut() {
-            if let Some(source) = source {
-                if let Ok(Err(err)) = with_primary_source_metadata(&source, |metadata| {
-                    xwm.new_selection(SelectionType::Primary, Some(metadata.mime_types.clone()))
-                }) {
-                    warn!(?err, "Failed to set Xwayland primary selection");
-                }
-            } else if let Err(err) = xwm.new_selection(SelectionType::Primary, None) {
-                warn!(?err, "Failed to clear Xwayland primary selection");
+            if let Err(err) = xwm.new_selection(ty, source.map(|source| source.mime_types())) {
+                warn!(?err, ?ty, "Failed to set Xwayland selection");
             }
         }
     }
 
     #[cfg(feature = "xwayland")]
-    fn send_selection(&mut self, mime_type: String, fd: OwnedFd, _seat: Seat<Self>, _user_data: &()) {
+    fn send_selection(
+        &mut self,
+        ty: SelectionTarget,
+        mime_type: String,
+        fd: OwnedFd,
+        _seat: Seat<Self>,
+        _user_data: &(),
+    ) {
         if let Some(xwm) = self.xwm.as_mut() {
-            if let Err(err) = xwm.send_selection(SelectionType::Primary, mime_type, fd, self.handle.clone()) {
+            if let Err(err) = xwm.send_selection(ty, mime_type, fd, self.handle.clone()) {
                 warn!(?err, "Failed to send primary (X11 -> Wayland)");
             }
         }
     }
 }
+
+impl<BackendData: Backend> PrimarySelectionHandler for AnvilState<BackendData> {
+    fn primary_selection_state(&self) -> &PrimarySelectionState {
+        &self.primary_selection_state
+    }
+}
 delegate_primary_selection!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
+
+impl<BackendData: Backend> DataControlHandler for AnvilState<BackendData> {
+    fn data_control_state(&self) -> &DataControlState {
+        &self.data_control_state
+    }
+}
+
+delegate_data_control!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
 impl<BackendData: Backend> ShmHandler for AnvilState<BackendData> {
     fn shm_state(&self) -> &ShmState {
@@ -266,14 +256,18 @@ impl<BackendData: Backend> SeatHandler for AnvilState<BackendData> {
     fn focus_changed(&mut self, seat: &Seat<Self>, target: Option<&FocusTarget>) {
         let dh = &self.display_handle;
 
-        let focus = target
-            .and_then(WaylandFocus::wl_surface)
-            .and_then(|s| dh.get_client(s.id()).ok());
+        let wl_surface = target.and_then(WaylandFocus::wl_surface);
+
+        let focus = wl_surface.and_then(|s| dh.get_client(s.id()).ok());
         set_data_device_focus(dh, seat, focus.clone());
         set_primary_focus(dh, seat, focus);
     }
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         *self.cursor_status.lock().unwrap() = image;
+    }
+
+    fn led_state_changed(&mut self, _seat: &Seat<Self>, led_state: LedState) {
+        self.backend_data.update_led_state(led_state)
     }
 }
 delegate_seat!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
@@ -281,6 +275,27 @@ delegate_seat!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 delegate_tablet_manager!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
 delegate_text_input_manager!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
+
+impl<BackendData: Backend> InputMethodHandler for AnvilState<BackendData> {
+    fn new_popup(&mut self, surface: PopupSurface) {
+        if let Err(err) = self.popups.track_popup(PopupKind::from(surface)) {
+            warn!("Failed to track popup: {}", err);
+        }
+    }
+
+    fn dismiss_popup(&mut self, surface: PopupSurface) {
+        if let Some(parent) = surface.get_parent().map(|parent| parent.surface.clone()) {
+            let _ = PopupManager::dismiss_popup(&parent, &PopupKind::from(surface));
+        }
+    }
+
+    fn parent_geometry(&self, parent: &WlSurface) -> Rectangle<i32, smithay::utils::Logical> {
+        self.space
+            .elements()
+            .find_map(|window| (window.wl_surface().as_ref() == Some(parent)).then(|| window.geometry()))
+            .unwrap_or_default()
+    }
+}
 
 delegate_input_method_manager!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
@@ -303,6 +318,18 @@ delegate_pointer_gestures!(@<BackendData: Backend + 'static> AnvilState<BackendD
 
 delegate_relative_pointer!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
+impl<BackendData: Backend> PointerConstraintsHandler for AnvilState<BackendData> {
+    fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
+        // XXX region
+        if pointer.current_focus().and_then(|x| x.wl_surface()).as_ref() == Some(surface) {
+            with_pointer_constraint(surface, pointer, |constraint| {
+                constraint.unwrap().activate();
+            });
+        }
+    }
+}
+delegate_pointer_constraints!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
+
 delegate_viewporter!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
 impl<BackendData: Backend> XdgActivationHandler for AnvilState<BackendData> {
@@ -310,9 +337,22 @@ impl<BackendData: Backend> XdgActivationHandler for AnvilState<BackendData> {
         &mut self.xdg_activation_state
     }
 
+    fn token_created(&mut self, _token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
+        if let Some((serial, seat)) = data.serial {
+            let keyboard = self.seat.get_keyboard().unwrap();
+            Seat::from_resource(&seat) == Some(self.seat.clone())
+                && keyboard
+                    .last_enter()
+                    .map(|last_enter| serial.is_no_older_than(&last_enter))
+                    .unwrap_or(false)
+        } else {
+            false
+        }
+    }
+
     fn request_activation(
         &mut self,
-        token: XdgActivationToken,
+        _token: XdgActivationToken,
         token_data: XdgActivationTokenData,
         surface: WlSurface,
     ) {
@@ -326,19 +366,7 @@ impl<BackendData: Backend> XdgActivationHandler for AnvilState<BackendData> {
             if let Some(window) = w {
                 self.space.raise_element(&window, true);
             }
-        } else {
-            // Discard the request
-            self.xdg_activation_state.remove_request(&token);
         }
-    }
-
-    fn destroy_activation(
-        &mut self,
-        _token: XdgActivationToken,
-        _token_data: XdgActivationTokenData,
-        _surface: WlSurface,
-    ) {
-        // The request is cancelled
     }
 }
 delegate_xdg_activation!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
@@ -457,8 +485,7 @@ impl<BackendData: Backend + 'static> SecurityContextHandler for AnvilState<Backe
                     ..ClientState::default()
                 };
                 if let Err(err) = data
-                    .display
-                    .handle()
+                    .display_handle
                     .insert_client(client_stream, Arc::new(client_state))
                 {
                     warn!("Error adding wayland client: {}", err);
@@ -484,12 +511,14 @@ delegate_xwayland_keyboard_grab!(@<BackendData: Backend + 'static> AnvilState<Ba
 
 impl<BackendData: Backend + 'static> AnvilState<BackendData> {
     pub fn init(
-        display: &mut Display<AnvilState<BackendData>>,
+        display: Display<AnvilState<BackendData>>,
         handle: LoopHandle<'static, CalloopData<BackendData>>,
         backend_data: BackendData,
         listen_on_socket: bool,
     ) -> AnvilState<BackendData> {
-        let clock = Clock::new().expect("failed to initialize clock");
+        let dh = display.handle();
+
+        let clock = Clock::new();
 
         // init wayland clients
         let socket_name = if listen_on_socket {
@@ -498,8 +527,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             handle
                 .insert_source(source, |client_stream, _, data| {
                     if let Err(err) = data
-                        .display
-                        .handle()
+                        .display_handle
                         .insert_client(client_stream, Arc::new(ClientState::default()))
                     {
                         warn!("Error adding wayland client: {}", err);
@@ -513,26 +541,26 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         };
         handle
             .insert_source(
-                Generic::new(
-                    display.backend().poll_fd().as_raw_fd(),
-                    Interest::READ,
-                    Mode::Level,
-                ),
-                |_, _, data| {
+                Generic::new(display, Interest::READ, Mode::Level),
+                |_, display, data| {
                     profiling::scope!("dispatch_clients");
-                    data.display.dispatch_clients(&mut data.state).unwrap();
+                    // Safety: we don't drop the display
+                    unsafe {
+                        display.get_mut().dispatch_clients(&mut data.state).unwrap();
+                    }
                     Ok(PostAction::Continue)
                 },
             )
             .expect("Failed to init wayland server source");
 
         // init globals
-        let dh = display.handle();
         let compositor_state = CompositorState::new::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
+        let data_control_state =
+            DataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
         let mut seat_state = SeatState::new();
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
@@ -542,15 +570,17 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         let presentation_state = PresentationState::new::<Self>(&dh, clock.id() as u32);
         let fractional_scale_manager_state = FractionalScaleManagerState::new::<Self>(&dh);
         TextInputManagerState::new::<Self>(&dh);
-        InputMethodManagerState::new::<Self>(&dh);
+        InputMethodManagerState::new::<Self, _>(&dh, |_client| true);
         VirtualKeyboardManagerState::new::<Self, _>(&dh, |_client| true);
         // Expose global only if backend supports relative motion events
         if BackendData::HAS_RELATIVE_MOTION {
             RelativePointerManagerState::new::<Self>(&dh);
         }
+        PointerConstraintsState::new::<Self>(&dh);
         if BackendData::HAS_GESTURES {
             PointerGesturesState::new::<Self>(&dh);
         }
+        TabletManagerState::new::<Self>(&dh);
         SecurityContextState::new::<Self, _>(&dh, |client| {
             client
                 .get_data::<ClientState>()
@@ -561,7 +591,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         let seat_name = backend_data.seat_name();
         let mut seat = seat_state.new_wl_seat(&dh, seat_name.clone());
 
-        let cursor_status = Arc::new(Mutex::new(CursorImageStatus::Default));
+        let cursor_status = Arc::new(Mutex::new(CursorImageStatus::default_named()));
         let pointer = seat.add_pointer();
         seat.add_keyboard(XkbConfig::default(), 200, 25)
             .expect("Failed to initialize the keyboard");
@@ -572,7 +602,6 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             *cursor_status2.lock().unwrap() = new_status;
         });
 
-        let dh = display.handle();
         let keyboard_shortcuts_inhibit_state = KeyboardShortcutsInhibitState::new::<Self>(&dh);
 
         #[cfg(feature = "xwayland")]
@@ -580,6 +609,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             XWaylandKeyboardGrabState::new::<Self>(&dh);
 
             let (xwayland, channel) = XWayland::new(&dh);
+            let dh = dh.clone();
             let ret = handle.insert_source(channel, move |event, _, data| match event {
                 XWaylandEvent::Ready {
                     connection,
@@ -612,7 +642,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
 
         AnvilState {
             backend_data,
-            display_handle: display.handle(),
+            display_handle: dh,
             socket_name,
             running: Arc::new(AtomicBool::new(true)),
             handle,
@@ -623,6 +653,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             layer_shell_state,
             output_manager_state,
             primary_selection_state,
+            data_control_state,
             seat_state,
             keyboard_shortcuts_inhibit_state,
             shm_state,
@@ -767,4 +798,5 @@ pub trait Backend {
     fn seat_name(&self) -> String;
     fn reset_buffers(&mut self, output: &Output);
     fn early_import(&mut self, surface: &WlSurface);
+    fn update_led_state(&mut self, led_state: LedState);
 }

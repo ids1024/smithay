@@ -11,7 +11,7 @@ use crate::{
     },
     utils::{user_data::UserDataMap, IsAlive, Logical, Rectangle, Serial, Size},
 };
-use encoding::{DecoderTrap, Encoding};
+use encoding_rs::WINDOWS_1252;
 use std::{
     collections::HashSet,
     sync::{Arc, Mutex, Weak},
@@ -30,7 +30,7 @@ use x11rb::{
     wrapper::ConnectionExt,
 };
 
-use super::XwmId;
+use super::{send_configure_notify, XwmId};
 
 /// X11 window managed by an [`X11Wm`](super::X11Wm)
 #[derive(Debug, Clone)]
@@ -58,6 +58,7 @@ pub(crate) struct SharedSurfaceState {
     title: String,
     class: String,
     instance: String,
+    startup_id: Option<String>,
     protocols: Protocols,
     hints: Option<WmHints>,
     normal_hints: Option<WmSizeHints>,
@@ -151,6 +152,7 @@ impl X11Surface {
                 title: String::from(""),
                 class: String::from(""),
                 instance: String::from(""),
+                startup_id: None,
                 protocols: Vec::new(),
                 hints: None,
                 normal_hints: None,
@@ -257,6 +259,7 @@ impl X11Surface {
                     .border_width(0);
                 conn.configure_window(frame, &aux)?;
                 conn.configure_window(self.window, &win_aux)?;
+                send_configure_notify(&conn, &self.window, rect, false)?;
             } else {
                 conn.configure_window(self.window, &aux)?;
             }
@@ -293,6 +296,11 @@ impl X11Surface {
     /// Returns the current window instance of the underlying X11 window
     pub fn instance(&self) -> String {
         self.state.lock().unwrap().class.clone()
+    }
+
+    /// Returns the startup id of the underlying X11 window
+    pub fn startup_id(&self) -> Option<String> {
+        self.state.lock().unwrap().startup_id.clone()
     }
 
     /// Returns if the window is considered to be a popup.
@@ -533,6 +541,7 @@ impl X11Surface {
             Some(atom) if atom == AtomEnum::WM_TRANSIENT_FOR.into() => self.update_transient_for(),
             Some(atom) if atom == self.atoms._NET_WM_WINDOW_TYPE => self.update_net_window_type(),
             Some(atom) if atom == self.atoms._MOTIF_WM_HINTS => self.update_motif_hints(),
+            Some(atom) if atom == self.atoms._NET_STARTUP_ID => self.update_startup_id(),
             Some(_) => Ok(()), // unknown
             None => {
                 self.update_title()?;
@@ -544,6 +553,7 @@ impl X11Surface {
                 // NET_WM_STATE is managed by the WM, we don't need to update it unless explicitly asked to
                 self.update_net_window_type()?;
                 self.update_motif_hints()?;
+                self.update_startup_id()?;
                 Ok(())
             }
         }
@@ -553,14 +563,8 @@ impl X11Surface {
         let conn = self.conn.upgrade().ok_or(ConnectionError::UnknownError)?;
         let (class, instance) = match WmClass::get(&*conn, self.window)?.reply_unchecked() {
             Ok(Some(wm_class)) => (
-                encoding::all::ISO_8859_1
-                    .decode(wm_class.class(), DecoderTrap::Replace)
-                    .ok()
-                    .unwrap_or_default(),
-                encoding::all::ISO_8859_1
-                    .decode(wm_class.instance(), DecoderTrap::Replace)
-                    .ok()
-                    .unwrap_or_default(),
+                WINDOWS_1252.decode(wm_class.class()).0.to_string(),
+                WINDOWS_1252.decode(wm_class.instance()).0.to_string(),
             ),
             Ok(None) | Err(ConnectionError::ParseError(_)) => (Default::default(), Default::default()), // Getting the property failed
             Err(err) => return Err(err),
@@ -621,6 +625,14 @@ impl X11Surface {
 
         let mut state = self.state.lock().unwrap();
         state.motif_hints = hints;
+        Ok(())
+    }
+
+    fn update_startup_id(&self) -> Result<(), ConnectionError> {
+        if let Some(startup_id) = self.read_window_property_string(self.atoms._NET_STARTUP_ID)? {
+            let mut state = self.state.lock().unwrap();
+            state.startup_id = Some(startup_id);
+        }
         Ok(())
     }
 
@@ -735,9 +747,7 @@ impl X11Surface {
         let bytes = bytes.collect::<Vec<u8>>();
 
         match reply.type_ {
-            x if x == AtomEnum::STRING.into() => Ok(encoding::all::ISO_8859_1
-                .decode(&bytes, DecoderTrap::Replace)
-                .ok()),
+            x if x == AtomEnum::STRING.into() => Ok(Some(WINDOWS_1252.decode(&bytes).0.to_string())),
             x if x == self.atoms.UTF8_STRING => Ok(String::from_utf8(bytes).ok()),
             _ => Ok(None),
         }
@@ -923,6 +933,12 @@ impl<D: SeatHandler + 'static> PointerTarget<D> for X11Surface {
     fn axis(&self, seat: &Seat<D>, data: &mut D, frame: AxisFrame) {
         if let Some(surface) = self.state.lock().unwrap().wl_surface.as_ref() {
             PointerTarget::axis(surface, seat, data, frame);
+        }
+    }
+
+    fn frame(&self, seat: &Seat<D>, data: &mut D) {
+        if let Some(surface) = self.state.lock().unwrap().wl_surface.as_ref() {
+            PointerTarget::frame(surface, seat, data);
         }
     }
 

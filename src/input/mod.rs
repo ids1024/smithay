@@ -50,6 +50,7 @@
 //! #   fn relative_motion(&self, seat: &Seat<State>, data: &mut State, event: &RelativeMotionEvent) {}
 //! #   fn button(&self, seat: &Seat<State>, data: &mut State, event: &ButtonEvent) {}
 //! #   fn axis(&self, seat: &Seat<State>, data: &mut State, frame: AxisFrame) {}
+//! #   fn frame(&self, seat: &Seat<State>, data: &mut State) {}
 //! #   fn leave(&self, seat: &Seat<State>, data: &mut State, serial: Serial, time: u32) {}
 //! #   fn gesture_swipe_begin(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeBeginEvent) {}
 //! #   fn gesture_swipe_update(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeUpdateEvent) {}
@@ -116,7 +117,7 @@ use std::{
 
 use tracing::{info_span, instrument};
 
-use self::keyboard::{Error as KeyboardError, KeyboardHandle, KeyboardTarget};
+use self::keyboard::{Error as KeyboardError, KeyboardHandle, KeyboardTarget, LedState};
 use self::pointer::{CursorImageStatus, PointerHandle, PointerTarget};
 use crate::utils::user_data::UserDataMap;
 
@@ -138,6 +139,9 @@ pub trait SeatHandler: Sized {
 
     /// Callback that will be notified whenever a client requests to set a custom cursor image.
     fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {}
+
+    /// Callback that will be notified whenever the keyboard led state changes.
+    fn led_state_changed(&mut self, _seat: &Seat<Self>, _led_state: LedState) {}
 }
 /// Delegate type for all [Seat] globals.
 ///
@@ -326,6 +330,7 @@ impl<D: SeatHandler + 'static> Seat<D> {
     /// #   fn relative_motion(&self, seat: &Seat<State>, data: &mut State, event: &RelativeMotionEvent) {}
     /// #   fn button(&self, seat: &Seat<State>, data: &mut State, event: &ButtonEvent) {}
     /// #   fn axis(&self, seat: &Seat<State>, data: &mut State, frame: AxisFrame) {}
+    /// #   fn frame(&self, seat: &Seat<State>, data: &mut State) {}
     /// #   fn leave(&self, seat: &Seat<State>, data: &mut State, serial: Serial, time: u32) {}
     /// #   fn gesture_swipe_begin(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeBeginEvent) {}
     /// #   fn gesture_swipe_update(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeUpdateEvent) {}
@@ -435,6 +440,7 @@ impl<D: SeatHandler + 'static> Seat<D> {
     /// #   fn relative_motion(&self, seat: &Seat<State>, data: &mut State, event: &RelativeMotionEvent) {}
     /// #   fn button(&self, seat: &Seat<State>, data: &mut State, event: &ButtonEvent) {}
     /// #   fn axis(&self, seat: &Seat<State>, data: &mut State, frame: AxisFrame) {}
+    /// #   fn frame(&self, seat: &Seat<State>, data: &mut State) {}
     /// #   fn leave(&self, seat: &Seat<State>, data: &mut State, serial: Serial, time: u32) {}
     /// #   fn gesture_swipe_begin(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeBeginEvent) {}
     /// #   fn gesture_swipe_update(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeUpdateEvent) {}

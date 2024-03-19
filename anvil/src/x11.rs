@@ -31,7 +31,10 @@ use smithay::{
         x11::{WindowBuilder, X11Backend, X11Event, X11Surface},
     },
     delegate_dmabuf,
-    input::pointer::{CursorImageAttributes, CursorImageStatus},
+    input::{
+        keyboard::LedState,
+        pointer::{CursorImageAttributes, CursorImageStatus},
+    },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         ash::vk::ExtPhysicalDeviceDrmFn,
@@ -40,13 +43,12 @@ use smithay::{
         wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
         wayland_server::{protocol::wl_surface, Display},
     },
-    utils::{DeviceFd, IsAlive, Point, Scale},
+    utils::{DeviceFd, IsAlive, Scale},
     wayland::{
         compositor,
         dmabuf::{
-            DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportError,
+            DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
         },
-        input_method::InputMethodSeat,
     },
 };
 use tracing::{error, info, trace, warn};
@@ -74,12 +76,12 @@ impl DmabufHandler for AnvilState<X11Data> {
         &mut self.backend_data.dmabuf_state
     }
 
-    fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf) -> Result<(), ImportError> {
-        self.backend_data
-            .renderer
-            .import_dmabuf(&dmabuf, None)
-            .map(|_| ())
-            .map_err(|_| ImportError::Failed)
+    fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
+        if self.backend_data.renderer.import_dmabuf(&dmabuf, None).is_ok() {
+            let _ = notifier.successful::<AnvilState<X11Data>>();
+        } else {
+            notifier.failed();
+        }
     }
 }
 delegate_dmabuf!(AnvilState<X11Data>);
@@ -92,11 +94,13 @@ impl Backend for X11Data {
         self.surface.reset_buffers();
     }
     fn early_import(&mut self, _surface: &wl_surface::WlSurface) {}
+    fn update_led_state(&mut self, _led_state: LedState) {}
 }
 
 pub fn run_x11() {
     let mut event_loop = EventLoop::try_new().unwrap();
-    let mut display = Display::new().unwrap();
+    let display = Display::new().unwrap();
+    let mut display_handle = display.handle();
 
     let backend = X11Backend::new().expect("Failed to initilize X11 backend");
     let handle = backend.handle();
@@ -109,7 +113,7 @@ pub fn run_x11() {
     // Create the gbm device for buffer allocation.
     let device = gbm::Device::new(DeviceFd::from(fd)).expect("Failed to create gbm device");
     // Initialize EGL using the GBM device.
-    let egl = EGLDisplay::new(device.clone()).expect("Failed to create EGLDisplay");
+    let egl = unsafe { EGLDisplay::new(device.clone()).expect("Failed to create EGLDisplay") };
     // Create the OpenGL context
     let context = EGLContext::new(&egl).expect("Failed to create EGLContext");
 
@@ -245,7 +249,7 @@ pub fn run_x11() {
         fps: fps_ticker::Fps::default(),
     };
 
-    let mut state = AnvilState::init(&mut display, event_loop.handle(), data, true);
+    let mut state = AnvilState::init(display, event_loop.handle(), data, true);
     state
         .shm_state
         .update_formats(state.backend_data.renderer.shm_formats());
@@ -278,8 +282,12 @@ pub fn run_x11() {
             }
             X11Event::Input(event) => {
                 data.state
-                    .process_input_event_windowed(&data.display.handle(), event, OUTPUT_NAME)
+                    .process_input_event_windowed(&data.display_handle, event, OUTPUT_NAME)
             }
+            X11Event::Focus(false) => {
+                data.state.release_all_keys();
+            }
+            _ => {}
         })
         .expect("Failed to insert X11 Backend into event loop");
 
@@ -334,7 +342,7 @@ pub fn run_x11() {
                 reset = !surface.alive();
             }
             if reset {
-                *cursor_guard = CursorImageStatus::Default;
+                *cursor_guard = CursorImageStatus::default_named();
             }
             let cursor_visible = !matches!(*cursor_guard, CursorImageStatus::Surface(_));
 
@@ -362,23 +370,6 @@ pub fn run_x11() {
                 scale,
                 1.0,
             ));
-
-            // draw input method surface if any
-            let input_method = state.seat.input_method();
-            let rectangle = input_method.coordinates();
-            let position = Point::from((
-                rectangle.loc.x + rectangle.size.w,
-                rectangle.loc.y + rectangle.size.h,
-            ));
-            input_method.with_surface(|surface| {
-                elements.extend(AsRenderElements::<GlesRenderer>::render_elements(
-                    &smithay::desktop::space::SurfaceTree::from_surface(surface),
-                    &mut backend_data.renderer,
-                    position.to_physical_precise_round(scale),
-                    scale,
-                    1.0,
-                ));
-            });
 
             // draw the dnd icon if any
             if let Some(surface) = state.dnd_icon.as_ref() {
@@ -470,16 +461,22 @@ pub fn run_x11() {
             profiling::finish_frame!();
         }
 
-        let mut calloop_data = CalloopData { state, display };
+        let mut calloop_data = CalloopData {
+            state,
+            display_handle,
+        };
         let result = event_loop.dispatch(Some(Duration::from_millis(16)), &mut calloop_data);
-        CalloopData { state, display } = calloop_data;
+        CalloopData {
+            state,
+            display_handle,
+        } = calloop_data;
 
         if result.is_err() {
             state.running.store(false, Ordering::SeqCst);
         } else {
             state.space.refresh();
             state.popups.cleanup();
-            display.flush_clients().unwrap();
+            display_handle.flush_clients().unwrap();
         }
     }
 }

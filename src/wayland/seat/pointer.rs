@@ -9,7 +9,7 @@ use wayland_protocols::wp::{
     relative_pointer::zv1::server::zwp_relative_pointer_v1::ZwpRelativePointerV1,
 };
 use wayland_server::{
-    backend::{ClientId, ObjectId},
+    backend::ClientId,
     protocol::{
         wl_pointer::{
             self, Axis as WlAxis, AxisSource as WlAxisSource, ButtonState as WlButtonState, Request,
@@ -27,15 +27,24 @@ use crate::{
             AxisFrame, ButtonEvent, CursorImageAttributes, CursorImageStatus, GestureHoldBeginEvent,
             GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent,
             GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent, MotionEvent,
-            PointerHandle, PointerInternal, PointerTarget, RelativeMotionEvent,
+            PointerHandle, PointerTarget, RelativeMotionEvent,
         },
         Seat,
     },
     utils::{Serial, SERIAL_COUNTER},
-    wayland::{compositor, pointer_gestures::PointerGestureUserData},
+    wayland::{
+        compositor, pointer_constraints::with_pointer_constraint, pointer_gestures::PointerGestureUserData,
+    },
 };
 
 use super::{SeatHandler, SeatState, WaylandFocus};
+
+// Use to accumulate discrete values for `wl_pointer` < 8
+#[derive(Default)]
+struct V120UserData {
+    x: i32,
+    y: i32,
+}
 
 impl<D: SeatHandler> PointerHandle<D> {
     pub(crate) fn new_pointer(&self, pointer: WlPointer) {
@@ -154,9 +163,6 @@ where
         }
         for_each_focused_pointers(seat, self, |ptr| {
             ptr.enter(serial.into(), self, event.location.x, event.location.y);
-            if ptr.version() >= 5 {
-                ptr.frame();
-            }
         })
     }
     fn leave(&self, seat: &Seat<D>, _data: &mut D, serial: Serial, time: u32) {
@@ -192,14 +198,21 @@ where
         });
         if let Some(pointer) = seat.get_pointer() {
             *pointer.last_enter.lock().unwrap() = None;
+            with_pointer_constraint(self, &pointer, |constraint| {
+                if let Some(constraint) = constraint {
+                    constraint.deactivate();
+                }
+            });
         }
+        compositor::with_states(self, |states| {
+            if let Some(data) = states.data_map.get::<Mutex<V120UserData>>() {
+                *data.lock().unwrap() = Default::default();
+            }
+        });
     }
     fn motion(&self, seat: &Seat<D>, _data: &mut D, event: &MotionEvent) {
         for_each_focused_pointers(seat, self, |ptr| {
             ptr.motion(event.time, event.location.x, event.location.y);
-            if ptr.version() >= 5 {
-                ptr.frame();
-            }
         })
     }
     fn relative_motion(&self, seat: &Seat<D>, _data: &mut D, event: &RelativeMotionEvent) {
@@ -219,9 +232,6 @@ where
     fn button(&self, seat: &Seat<D>, _data: &mut D, event: &ButtonEvent) {
         for_each_focused_pointers(seat, self, |ptr| {
             ptr.button(event.serial.into(), event.time, event.button, event.state.into());
-            if ptr.version() >= 5 {
-                ptr.frame();
-            }
         })
     }
     fn axis(&self, seat: &Seat<D>, _data: &mut D, details: AxisFrame) {
@@ -243,34 +253,81 @@ where
                     ptr.axis_source(source);
                 }
                 // axis discrete
-                if let Some((x, y)) = details.discrete {
-                    if x != 0 {
-                        ptr.axis_discrete(WlAxis::HorizontalScroll, x);
-                    }
-                    if y != 0 {
-                        ptr.axis_discrete(WlAxis::VerticalScroll, y);
+                if let Some((x, y)) = details.v120 {
+                    if ptr.version() >= 8 {
+                        if x != 0 {
+                            ptr.axis_value120(WlAxis::HorizontalScroll, x);
+                        }
+                        if y != 0 {
+                            ptr.axis_value120(WlAxis::VerticalScroll, y);
+                        }
+                    } else {
+                        compositor::with_states(self, |states| {
+                            let mut data = states
+                                .data_map
+                                .get_or_insert_threadsafe(Mutex::<V120UserData>::default)
+                                .lock()
+                                .unwrap();
+
+                            data.x += x;
+                            if data.x.abs() >= 120 {
+                                ptr.axis_discrete(WlAxis::HorizontalScroll, data.x / 120);
+                                data.x %= 120;
+                            }
+
+                            data.y += y;
+                            if data.y.abs() >= 120 {
+                                ptr.axis_discrete(WlAxis::VerticalScroll, data.y / 120);
+                                data.y %= 120;
+                            }
+                        });
                     }
                 }
                 // stop
                 if details.stop.0 {
                     ptr.axis_stop(details.time, WlAxis::HorizontalScroll);
+
+                    compositor::with_states(self, |states| {
+                        if let Some(data) = states.data_map.get::<Mutex<V120UserData>>() {
+                            data.lock().unwrap().x = 0;
+                        }
+                    });
                 }
                 if details.stop.1 {
                     ptr.axis_stop(details.time, WlAxis::VerticalScroll);
+
+                    compositor::with_states(self, |states| {
+                        if let Some(data) = states.data_map.get::<Mutex<V120UserData>>() {
+                            data.lock().unwrap().y = 0;
+                        }
+                    });
                 }
             }
             // axis
             if details.axis.0 != 0.0 {
+                if ptr.version() >= 9 {
+                    ptr.axis_relative_direction(
+                        WlAxis::HorizontalScroll,
+                        details.relative_direction.0.into(),
+                    );
+                }
                 ptr.axis(details.time, WlAxis::HorizontalScroll, details.axis.0);
             }
             if details.axis.1 != 0.0 {
+                if ptr.version() >= 9 {
+                    ptr.axis_relative_direction(WlAxis::VerticalScroll, details.relative_direction.1.into());
+                }
                 ptr.axis(details.time, WlAxis::VerticalScroll, details.axis.1);
             }
+        })
+    }
+
+    fn frame(&self, seat: &Seat<D>, _data: &mut D) {
+        for_each_focused_pointers(seat, self, |ptr| {
             if ptr.version() >= 5 {
-                // frame
                 ptr.frame();
             }
-        })
+        });
     }
 
     fn gesture_swipe_begin(&self, seat: &Seat<D>, _data: &mut D, event: &GestureSwipeBeginEvent) {
@@ -426,93 +483,96 @@ where
     ) {
         match request {
             Request::SetCursor {
+                serial,
                 surface,
                 hotspot_x,
                 hotspot_y,
-                serial,
             } => {
-                if let Some(ref handle) = data.handle {
-                    if !handle
-                        .last_enter
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .map(|last_serial| last_serial.0 == serial)
-                        .unwrap_or(false)
-                    {
-                        return; // Ignore mismatches in serial
-                    }
+                let handle = match &data.handle {
+                    Some(handle) => handle,
+                    None => return,
+                };
 
-                    let seat = {
-                        let seat_state = state.seat_state();
-                        seat_state
-                            .seats
-                            .iter()
-                            .find(|seat| seat.get_pointer().map(|h| &h == handle).unwrap_or(false))
-                            .cloned()
-                    };
+                if !handle
+                    .last_enter
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|last_serial| last_serial.0 == serial)
+                    .unwrap_or(false)
+                {
+                    return; // Ignore mismatches in serial
+                }
 
-                    let guard = handle.inner.lock().unwrap();
-                    // only allow setting the cursor icon if the current pointer focus
-                    // is of the same client
-                    let PointerInternal { ref focus, .. } = *guard;
-                    if let Some((ref focus, _)) = *focus {
-                        if focus.same_client_as(&pointer.id()) {
-                            match surface {
-                                Some(surface) => {
-                                    // tolerate re-using the same surface
-                                    if compositor::give_role(&surface, CURSOR_IMAGE_ROLE).is_err()
-                                        && compositor::get_role(&surface) != Some(CURSOR_IMAGE_ROLE)
-                                    {
-                                        pointer.post_error(
-                                            wl_pointer::Error::Role,
-                                            "Given wl_surface has another role.",
-                                        );
-                                        return;
-                                    }
-                                    compositor::with_states(&surface, |states| {
-                                        states.data_map.insert_if_missing_threadsafe(|| {
-                                            Mutex::new(CursorImageAttributes {
-                                                hotspot: (0, 0).into(),
-                                            })
-                                        });
-                                        states
-                                            .data_map
-                                            .get::<Mutex<CursorImageAttributes>>()
-                                            .unwrap()
-                                            .lock()
-                                            .unwrap()
-                                            .hotspot = (hotspot_x, hotspot_y).into();
-                                    });
+                // Only allow setting the cursor icon if the current pointer focus is of the same
+                // client.
+                if !handle
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .focus
+                    .as_ref()
+                    .map(|(focus, _)| focus.same_client_as(&pointer.id()))
+                    .unwrap_or(false)
+                {
+                    return;
+                }
 
-                                    if let Some(seat) = seat {
-                                        state.cursor_image(&seat, CursorImageStatus::Surface(surface));
-                                    }
-                                }
-                                None => {
-                                    if let Some(seat) = seat {
-                                        state.cursor_image(&seat, CursorImageStatus::Hidden);
-                                    }
-                                }
-                            }
+                let cursor_image = match surface {
+                    Some(surface) => {
+                        // tolerate re-using the same surface
+                        if compositor::give_role(&surface, CURSOR_IMAGE_ROLE).is_err()
+                            && compositor::get_role(&surface) != Some(CURSOR_IMAGE_ROLE)
+                        {
+                            pointer.post_error(wl_pointer::Error::Role, "Given wl_surface has another role.");
+                            return;
                         }
+
+                        compositor::with_states(&surface, |states| {
+                            states.data_map.insert_if_missing_threadsafe(|| {
+                                Mutex::new(CursorImageAttributes {
+                                    hotspot: (0, 0).into(),
+                                })
+                            });
+                            states
+                                .data_map
+                                .get::<Mutex<CursorImageAttributes>>()
+                                .unwrap()
+                                .lock()
+                                .unwrap()
+                                .hotspot = (hotspot_x, hotspot_y).into();
+                        });
+
+                        CursorImageStatus::Surface(surface)
                     }
+                    None => CursorImageStatus::Hidden,
+                };
+
+                let seat = state
+                    .seat_state()
+                    .seats
+                    .iter()
+                    .find(|seat| seat.get_pointer().map(|h| h == *handle).unwrap_or(false))
+                    .cloned();
+
+                if let Some(seat) = seat {
+                    state.cursor_image(&seat, cursor_image)
                 }
             }
             Request::Release => {
                 // Our destructors already handle it
             }
             _ => unreachable!(),
-        }
+        };
     }
 
-    fn destroyed(_state: &mut D, _: ClientId, object_id: ObjectId, data: &PointerUserData<D>) {
+    fn destroyed(_state: &mut D, _: ClientId, pointer: &WlPointer, data: &PointerUserData<D>) {
         if let Some(ref handle) = data.handle {
             handle
                 .known_pointers
                 .lock()
                 .unwrap()
-                .retain(|p| p.id() != object_id);
+                .retain(|p| p.id() != pointer.id());
         }
     }
 }

@@ -1,19 +1,18 @@
 //! Module for Buffers created using [libgbm](gbm).
 //!
-//! The re-exported [`GbmDevice`](gbm::Device) implements the [`Allocator`](super::Allocator) trait
-//! and [`GbmBuffer`](gbm::BufferObject) satisfies the [`Buffer`](super::Buffer) trait while also allowing
+//! The re-exported [`GbmDevice`](gbm::Device) implements the [`Allocator`] trait
+//! and [`GbmBuffer`](gbm::BufferObject) satisfies the [`Buffer`] trait while also allowing
 //! conversions to and from [dmabufs](super::dmabuf).
 
 use super::{
     dmabuf::{AsDmabuf, Dmabuf, DmabufFlags, MAX_PLANES},
     Allocator, Buffer, Format, Fourcc, Modifier,
 };
+#[cfg(feature = "backend_drm")]
+use crate::backend::drm::DrmNode;
 use crate::utils::{Buffer as BufferCoords, Size};
 pub use gbm::{BufferObject as GbmBuffer, BufferObjectFlags as GbmBufferFlags, Device as GbmDevice};
-use std::{
-    convert::{AsMut, AsRef},
-    os::unix::io::{AsFd, AsRawFd, BorrowedFd},
-};
+use std::os::unix::io::{AsFd, BorrowedFd};
 use tracing::instrument;
 
 /// Light wrapper around an [`GbmDevice`] to implement the [`Allocator`]-trait
@@ -71,10 +70,19 @@ impl<A: AsFd + 'static> GbmAllocator<A> {
             modifiers.iter().copied(),
             flags,
         );
+
         #[cfg(not(feature = "backend_gbm_has_create_with_modifiers2"))]
-        let result =
+        let result = if (flags & !(GbmBufferFlags::SCANOUT | GbmBufferFlags::RENDERING)).is_empty() {
             self.device
-                .create_buffer_object_with_modifiers(width, height, fourcc, modifiers.iter().copied());
+                .create_buffer_object_with_modifiers(width, height, fourcc, modifiers.iter().copied())
+        } else if modifiers.contains(&Modifier::Invalid) || modifiers.contains(&Modifier::Linear) {
+            return self.device.create_buffer_object(width, height, fourcc, flags);
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "unsupported combination of flags and modifiers",
+            ));
+        };
 
         match result {
             Ok(bo) => Ok(bo),
@@ -163,8 +171,12 @@ impl<T> AsDmabuf for GbmBuffer<T> {
                 idx as u32,
                 self.offset(idx)?,
                 self.stride_for_plane(idx)?,
-                self.modifier()?,
             );
+        }
+
+        #[cfg(feature = "backend_drm")]
+        if let Some(node) = self.device_fd().ok().and_then(|fd| DrmNode::from_file(fd).ok()) {
+            builder.set_node(node);
         }
 
         Ok(builder.build().unwrap())
@@ -204,9 +216,14 @@ impl<T> AsDmabuf for GbmBuffer<T> {
                 idx as u32,
                 self.offset(idx)?,
                 self.stride_for_plane(idx)?,
-                self.modifier()?,
             );
         }
+
+        #[cfg(feature = "backend_drm")]
+        if let Some(node) = self.device_fd().ok().and_then(|fd| DrmNode::from_file(fd).ok()) {
+            builder.set_node(node);
+        }
+
         Ok(builder.build().unwrap())
     }
 }
@@ -219,9 +236,9 @@ impl Dmabuf {
         gbm: &GbmDevice<A>,
         usage: GbmBufferFlags,
     ) -> std::io::Result<GbmBuffer<T>> {
-        let mut handles = [0; MAX_PLANES];
+        let mut handles = [None; MAX_PLANES];
         for (i, handle) in self.handles().take(MAX_PLANES).enumerate() {
-            handles[i] = handle.as_raw_fd();
+            handles[i] = Some(handle);
         }
         let mut strides = [0i32; MAX_PLANES];
         for (i, stride) in self.strides().take(MAX_PLANES).enumerate() {
@@ -246,7 +263,7 @@ impl Dmabuf {
             )
         } else {
             gbm.import_buffer_object_from_dma_buf(
-                handles[0],
+                handles[0].unwrap(),
                 self.width(),
                 self.height(),
                 strides[0] as u32,
