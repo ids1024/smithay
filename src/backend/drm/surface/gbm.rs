@@ -399,9 +399,9 @@ where
         };
 
         let flip = if self.drm.commit_pending() {
-            self.drm.commit([plane_state], true)
+            self.drm.commit([plane_state], true, None)
         } else {
-            self.drm.page_flip([plane_state], true)
+            self.drm.page_flip([plane_state], true, None)
         };
         if flip.is_ok() {
             self.pending_fb = Some((slot, user_data));

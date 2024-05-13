@@ -1,5 +1,5 @@
 use std::io;
-use std::os::unix::io::{AsFd, BorrowedFd};
+use std::os::unix::io::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -359,9 +359,10 @@ impl DrmSurface {
         &self,
         planes: impl IntoIterator<Item = PlaneState<'a>>,
         event: bool,
+        out_fence_fd: Option<&mut Option<OwnedFd>>,
     ) -> Result<(), Error> {
         match &*self.internal {
-            DrmSurfaceInternal::Atomic(surf) => surf.commit(planes, event),
+            DrmSurfaceInternal::Atomic(surf) => surf.commit(planes, event, out_fence_fd),
             DrmSurfaceInternal::Legacy(surf) => {
                 let fb = ensure_legacy_planes(self, planes)?;
                 surf.commit(fb, event)
@@ -381,9 +382,10 @@ impl DrmSurface {
         &self,
         planes: impl IntoIterator<Item = PlaneState<'a>>,
         event: bool,
+        out_fence_fd: Option<&mut Option<OwnedFd>>,
     ) -> Result<(), Error> {
         match &*self.internal {
-            DrmSurfaceInternal::Atomic(surf) => surf.page_flip(planes, event),
+            DrmSurfaceInternal::Atomic(surf) => surf.page_flip(planes, event, out_fence_fd),
             DrmSurfaceInternal::Legacy(surf) => {
                 let fb = ensure_legacy_planes(self, planes)?;
                 surf.page_flip(fb, event)

@@ -752,11 +752,13 @@ impl<B: Framebuffer> FrameState<B> {
         supports_fencing: bool,
         allow_partial_update: bool,
         event: bool,
+        out_fence_fd: &mut Option<OwnedFd>,
     ) -> Result<(), crate::backend::drm::error::Error> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
         surface.commit(
             self.build_planes(surface, supports_fencing, allow_partial_update),
             event,
+            Some(out_fence_fd),
         )
     }
 
@@ -767,11 +769,13 @@ impl<B: Framebuffer> FrameState<B> {
         supports_fencing: bool,
         allow_partial_update: bool,
         event: bool,
+        out_fence_fd: &mut Option<OwnedFd>,
     ) -> Result<(), crate::backend::drm::error::Error> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
         surface.page_flip(
             self.build_planes(surface, supports_fencing, allow_partial_update),
             event,
+            Some(out_fence_fd),
         )
     }
 
@@ -1486,6 +1490,7 @@ impl From<&PlaneInfo> for PlaneAssignment {
 
 struct PendingFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>, U> {
     frame: Frame<A, F>,
+    out_fence_fd: Option<OwnedFd>,
     user_data: U,
 }
 
@@ -2763,14 +2768,23 @@ where
         } = self.queued_frame.take().unwrap();
 
         let allow_partial_update = prepared_frame.kind == PreparedFrameKind::Partial;
+        let mut out_fence_fd = None;
         let flip = if self.surface.commit_pending() {
-            prepared_frame
-                .frame
-                .commit(&self.surface, self.supports_fencing, allow_partial_update, true)
+            prepared_frame.frame.commit(
+                &self.surface,
+                self.supports_fencing,
+                allow_partial_update,
+                true,
+                &mut out_fence_fd,
+            )
         } else {
-            prepared_frame
-                .frame
-                .page_flip(&self.surface, self.supports_fencing, allow_partial_update, true)
+            prepared_frame.frame.page_flip(
+                &self.surface,
+                self.supports_fencing,
+                allow_partial_update,
+                true,
+                &mut out_fence_fd,
+            )
         };
 
         match flip {
@@ -2782,6 +2796,7 @@ where
                 self.pending_frame = Some(PendingFrame {
                     frame: prepared_frame.frame,
                     user_data,
+                    out_fence_fd,
                 });
             }
             Err(crate::backend::drm::error::Error::Access(ref access))
@@ -2822,8 +2837,21 @@ where
     /// Otherwise the underlying swapchain will run out of buffers eventually.
     #[profiling::function]
     pub fn frame_submitted(&mut self) -> FrameResult<Option<U>, A, F> {
-        if let Some(PendingFrame { mut frame, user_data }) = self.pending_frame.take() {
+        if let Some(PendingFrame {
+            mut frame,
+            user_data,
+            out_fence_fd,
+        }) = self.pending_frame.take()
+        {
+            // TODO actually, want to use out fence before waiting for submitted?
+            dbg!(out_fence_fd);
             std::mem::swap(&mut frame, &mut self.current_frame);
+            for plane in frame.planes.values() {
+                // TODO need to block release of *previous* frame buffers on out_fence_fd
+                if let Some(config) = plane.config.as_ref() {
+                    //config.buffer.foo();
+                }
+            }
             if self.queued_frame.is_some() {
                 self.submit()?;
             }

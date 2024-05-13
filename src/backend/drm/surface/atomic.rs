@@ -5,7 +5,7 @@ use drm::control::{
 };
 
 use std::collections::HashSet;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::sync::Mutex;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -338,6 +338,7 @@ impl AtomicDrmSurface {
                     }),
                 }],
                 Some(pending.blob),
+                None,
             )?;
             self.fd
                 .atomic_commit(
@@ -390,6 +391,7 @@ impl AtomicDrmSurface {
                 }),
             }],
             Some(pending.blob),
+            None,
         )?;
         self.fd
             .atomic_commit(
@@ -444,6 +446,7 @@ impl AtomicDrmSurface {
                 }),
             }],
             Some(pending.blob),
+            None,
         )?;
 
         self.fd
@@ -496,6 +499,7 @@ impl AtomicDrmSurface {
                 }),
             }],
             Some(new_blob),
+            None,
         )?;
         if let Err(err) = self
             .fd
@@ -541,7 +545,7 @@ impl AtomicDrmSurface {
         let mut removed = current_conns.difference(&pending_conns);
         let mut added = pending_conns.difference(&current_conns);
 
-        let req = self.build_request(&mut added, &mut removed, &*planes, Some(pending.blob))?;
+        let req = self.build_request(&mut added, &mut removed, &*planes, Some(pending.blob), None)?;
 
         let flags = if allow_modeset {
             AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY
@@ -563,6 +567,7 @@ impl AtomicDrmSurface {
         &self,
         planes: impl IntoIterator<Item = PlaneState<'a>>,
         event: bool,
+        out_fence_fd: Option<&mut Option<OwnedFd>>,
     ) -> Result<(), Error> {
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
@@ -605,7 +610,13 @@ impl AtomicDrmSurface {
 
         // test the new config and return the request if it would be accepted by the driver.
         let req = {
-            let req = self.build_request(&mut added, &mut removed, &*planes, Some(pending.blob))?;
+            let req = self.build_request(
+                &mut added,
+                &mut removed,
+                &*planes,
+                Some(pending.blob),
+                out_fence_fd,
+            )?;
 
             if let Err(err) = self.fd.atomic_commit(
                 AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
@@ -674,6 +685,7 @@ impl AtomicDrmSurface {
         &self,
         planes: impl IntoIterator<Item = PlaneState<'a>>,
         event: bool,
+        out_fence_fd: Option<&mut Option<OwnedFd>>,
     ) -> Result<(), Error> {
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
@@ -683,7 +695,7 @@ impl AtomicDrmSurface {
         let planes = planes.into_iter().collect::<Vec<_>>();
 
         // page flips work just like commits with fewer parameters..
-        let req = self.build_request(&mut [].iter(), &mut [].iter(), &*planes, None)?;
+        let req = self.build_request(&mut [].iter(), &mut [].iter(), &*planes, None, out_fence_fd)?;
 
         // .. and without `AtomicCommitFlags::AllowModeset`.
         // If we would set anything here, that would require a modeset, this would fail,
@@ -729,6 +741,7 @@ impl AtomicDrmSurface {
         removed_connectors: &mut dyn Iterator<Item = &connector::Handle>,
         planes: impl IntoIterator<Item = &'a PlaneState<'a>>,
         blob: Option<property::Value<'static>>,
+        out_fence_fd: Option<&mut Option<OwnedFd>>,
     ) -> Result<AtomicModeReq, Error> {
         let prop_mapping = self.prop_mapping.read().unwrap();
 
@@ -774,6 +787,17 @@ impl AtomicDrmSurface {
             prop_mapping.crtc_prop_handle(self.crtc, "ACTIVE")?,
             property::Value::Boolean(true),
         );
+
+        if let Some(out_fence_fd) = out_fence_fd {
+            if let Ok(prop) = crtc_prop_handle(&prop_mapping, self.crtc, "OUT_FENCE_PTR") {
+                // TODO Strict pointer provenance?
+                req.add_property(
+                    self.crtc,
+                    prop,
+                    property::Value::UnsignedRange(out_fence_fd as *mut _ as _),
+                );
+            }
+        }
 
         for plane_state in planes.into_iter() {
             let handle = &plane_state.handle;
