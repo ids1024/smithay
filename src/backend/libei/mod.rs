@@ -12,18 +12,18 @@
 use calloop::{EventSource, PostAction, Readiness, Token, TokenFactory};
 use once_cell::sync::Lazy;
 use reis::{
-    calloop::{ConnectedContextState, EisRequestSourceEvent},
+    calloop::EisRequestSourceEvent,
     eis::{self, device::DeviceType},
-    request::{self, DeviceCapability, EisRequest},
+    request::{self, Connection, DeviceCapability, EisRequest},
 };
 use rustix::fd::AsFd;
-use std::{collections::HashMap, ffi::CString, io, path::PathBuf};
+use std::{collections::HashMap, ffi::CStr, io, path::PathBuf};
 use xkbcommon::xkb;
 
 use crate::{
     backend::input::{self, InputBackend, InputEvent},
     input::keyboard::XkbConfig,
-    utils::sealed_file::SealedFile,
+    utils::SealedFile,
 };
 
 static SERVER_INTERFACES: Lazy<HashMap<&'static str, u32>> = Lazy::new(|| {
@@ -80,23 +80,21 @@ pub struct EiInput {
 impl EiInput {
     pub fn new(context: eis::Context) -> Self {
         Self {
-            source: reis::calloop::EisRequestSource::new(context, &SERVER_INTERFACES, 0),
+            source: reis::calloop::EisRequestSource::new(context, 0),
             seat: None,
         }
     }
 }
 
 fn disconnected(
-    connected_state: &ConnectedContextState,
+    connection: &Connection,
     reason: eis::connection::DisconnectReason,
     explaination: &str,
 ) -> io::Result<calloop::PostAction> {
-    connected_state.connection.disconnected(
-        connected_state.request_converter.last_serial(),
-        reason,
-        explaination,
-    );
-    connected_state.context.flush();
+    connection
+        .connection()
+        .disconnected(connection.last_serial(), reason, explaination);
+    connection.flush();
     Ok(calloop::PostAction::Remove)
 }
 
@@ -170,8 +168,8 @@ impl<T: request::DeviceEvent + request::EventTime> input::Event<EiInput> for T {
 }
 
 impl input::KeyboardKeyEvent<EiInput> for request::KeyboardKey {
-    fn key_code(&self) -> u32 {
-        self.key
+    fn key_code(&self) -> input::Keycode {
+        input::Keycode::from(self.key + 8)
     }
 
     fn state(&self) -> input::KeyState {
@@ -380,123 +378,120 @@ impl EventSource for EiInput {
     where
         F: FnMut(InputEvent<EiInput>, &mut ()) -> (),
     {
-        self.source
-            .process_events(readiness, token, |event, connected_state| {
-                match event {
-                    Ok(EisRequestSourceEvent::Connected) => {
-                        let seat = connected_state.request_converter.add_seat(
-                            Some("default"),
-                            &[
-                                DeviceCapability::Pointer,
-                                DeviceCapability::PointerAbsolute,
-                                DeviceCapability::Keyboard,
-                                DeviceCapability::Touch,
-                                DeviceCapability::Scroll,
-                                DeviceCapability::Button,
-                            ],
+        self.source.process_events(readiness, token, |event, connection| {
+            match event {
+                Ok(EisRequestSourceEvent::Connected) => {
+                    let seat = connection.add_seat(
+                        Some("default"),
+                        &[
+                            DeviceCapability::Pointer,
+                            DeviceCapability::PointerAbsolute,
+                            DeviceCapability::Keyboard,
+                            DeviceCapability::Touch,
+                            DeviceCapability::Scroll,
+                            DeviceCapability::Button,
+                        ],
+                    );
+
+                    self.seat = Some(seat);
+                }
+                Ok(EisRequestSourceEvent::Request(EisRequest::Disconnect)) => {
+                    return Ok(PostAction::Remove);
+                }
+                Ok(EisRequestSourceEvent::Request(EisRequest::Bind(request))) => {
+                    let capabilities = request.capabilities;
+
+                    // TODO Handle in converter
+                    if capabilities & 0x7e != capabilities {
+                        let serial = connection.next_serial();
+                        request.seat.eis_seat().destroyed(serial);
+                        return disconnected(
+                            connection,
+                            eis::connection::DisconnectReason::Value,
+                            "Invalid capabilities",
                         );
-
-                        self.seat = Some(seat);
                     }
-                    Ok(EisRequestSourceEvent::Request(EisRequest::Disconnect)) => {
-                        return Ok(PostAction::Remove);
+
+                    let seat = self.seat.as_ref().unwrap();
+
+                    if connection.has_interface("ei_keyboard")
+                        && capabilities & 2 << DeviceCapability::Keyboard as u64 != 0
+                    {
+                        // XXX use seat keymap
+                        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+                        let keymap = XkbConfig::default().compile_keymap(&context).unwrap();
+                        let keymap_text = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
+                        let file = SealedFile::with_data(
+                            CStr::from_bytes_with_nul(b"eis-keymap\0").unwrap(),
+                            keymap_text.as_bytes(),
+                        )
+                        .unwrap();
+
+                        let device = seat.add_device(
+                            Some("keyboard"),
+                            DeviceType::Virtual,
+                            &[DeviceCapability::Keyboard],
+                            |device| {
+                                let keyboard = device.interface::<eis::Keyboard>().unwrap();
+                                keyboard.keymap(
+                                    eis::keyboard::KeymapType::Xkb,
+                                    keymap_text.len() as _,
+                                    file.as_fd(),
+                                );
+                            },
+                        );
                     }
-                    Ok(EisRequestSourceEvent::Request(EisRequest::Bind(request))) => {
-                        let capabilities = request.capabilities;
 
-                        // TODO Handle in converter
-                        if capabilities & 0x7e != capabilities {
-                            let serial = connected_state.request_converter.next_serial();
-                            request.seat.eis_seat().destroyed(serial);
-                            return disconnected(
-                                connected_state,
-                                eis::connection::DisconnectReason::Value,
-                                "Invalid capabilities",
-                            );
-                        }
-
-                        if connected_state.has_interface("ei_keyboard")
-                            && capabilities & 2 << DeviceCapability::Keyboard as u64 != 0
-                        {
-                            // XXX use seat keymap
-                            let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-                            let keymap = XkbConfig::default().compile_keymap(&context).unwrap();
-                            let keymap_text = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
-                            let file = SealedFile::with_data(
-                                CString::new("eis-keymap").unwrap(),
-                                keymap_text.as_bytes(),
-                            )
-                            .unwrap();
-
-                            let device = connected_state.request_converter.add_device(
-                                self.seat.as_ref().unwrap(),
-                                Some("keyboard"),
-                                DeviceType::Virtual,
-                                &[DeviceCapability::Keyboard],
-                                |device| {
-                                    let keyboard = device.interface::<eis::Keyboard>().unwrap();
-                                    keyboard.keymap(
-                                        eis::keyboard::KeymapType::Xkb,
-                                        keymap_text.len() as _,
-                                        file.as_fd(),
-                                    );
-                                },
-                            );
-                        }
-
-                        // XXX button/etc should be on same object
-                        if connected_state.has_interface("ei_pointer")
-                            && capabilities & 2 << DeviceCapability::Pointer as u64 != 0
-                        {
-                            connected_state.request_converter.add_device(
-                                self.seat.as_ref().unwrap(),
-                                Some("pointer"),
-                                DeviceType::Virtual,
-                                &[DeviceCapability::Pointer],
-                                |_| {},
-                            );
-                        }
-
-                        if connected_state.has_interface("ei_touchscreen")
-                            && capabilities & 2 << DeviceCapability::Touch as u64 != 0
-                        {
-                            connected_state.request_converter.add_device(
-                                self.seat.as_ref().unwrap(),
-                                Some("touch"),
-                                DeviceType::Virtual,
-                                &[DeviceCapability::Touch],
-                                |_| {},
-                            );
-                        }
-
-                        if connected_state.has_interface("ei_pointer_absolute")
-                            && capabilities & 2 << DeviceCapability::PointerAbsolute as u64 != 0
-                        {
-                            connected_state.request_converter.add_device(
-                                self.seat.as_ref().unwrap(),
-                                Some("pointer-abs"),
-                                DeviceType::Virtual,
-                                &[DeviceCapability::PointerAbsolute],
-                                |_| {},
-                            );
-                        }
-
-                        // TODO create devices; compare against current bitflag
+                    // XXX button/etc should be on same object
+                    if connection.has_interface("ei_pointer")
+                        && capabilities & 2 << DeviceCapability::Pointer as u64 != 0
+                    {
+                        seat.add_device(
+                            Some("pointer"),
+                            DeviceType::Virtual,
+                            &[DeviceCapability::Pointer],
+                            |_| {},
+                        );
                     }
-                    Ok(EisRequestSourceEvent::Request(request)) => {
-                        if let Some(input_event) = convert_request(request) {
-                            cb(input_event, &mut ());
-                        }
+
+                    if connection.has_interface("ei_touchscreen")
+                        && capabilities & 2 << DeviceCapability::Touch as u64 != 0
+                    {
+                        seat.add_device(
+                            Some("touch"),
+                            DeviceType::Virtual,
+                            &[DeviceCapability::Touch],
+                            |_| {},
+                        );
                     }
-                    Ok(EisRequestSourceEvent::InvalidObject(_object_id)) => {}
-                    Err(err) => {
-                        tracing::error!("Libei client error: {}", err);
-                        return Ok(PostAction::Remove);
+
+                    if connection.has_interface("ei_pointer_absolute")
+                        && capabilities & 2 << DeviceCapability::PointerAbsolute as u64 != 0
+                    {
+                        seat.add_device(
+                            Some("pointer-abs"),
+                            DeviceType::Virtual,
+                            &[DeviceCapability::PointerAbsolute],
+                            |_| {},
+                        );
+                    }
+
+                    // TODO create devices; compare against current bitflag
+                }
+                Ok(EisRequestSourceEvent::Request(request)) => {
+                    if let Some(input_event) = convert_request(request) {
+                        cb(input_event, &mut ());
                     }
                 }
-                connected_state.context.flush();
-                Ok(PostAction::Continue)
-            })
+                Ok(EisRequestSourceEvent::InvalidObject(_object_id)) => {}
+                Err(err) => {
+                    tracing::error!("Libei client error: {}", err);
+                    return Ok(PostAction::Remove);
+                }
+            }
+            connection.flush();
+            Ok(PostAction::Continue)
+        })
     }
 
     fn register(
