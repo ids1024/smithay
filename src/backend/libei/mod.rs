@@ -91,9 +91,7 @@ fn disconnected(
     reason: eis::connection::DisconnectReason,
     explaination: &str,
 ) -> io::Result<calloop::PostAction> {
-    connection
-        .connection()
-        .disconnected(connection.last_serial(), reason, explaination);
+    connection.disconnected(reason, explaination);
     connection.flush();
     Ok(calloop::PostAction::Remove)
 }
@@ -403,8 +401,6 @@ impl EventSource for EiInput {
 
                     // TODO Handle in converter
                     if capabilities & 0x7e != capabilities {
-                        let serial = connection.next_serial();
-                        request.seat.eis_seat().destroyed(serial);
                         return disconnected(
                             connection,
                             eis::connection::DisconnectReason::Value,
