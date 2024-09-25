@@ -789,7 +789,7 @@ impl AtomicDrmSurface {
         );
 
         if let Some(out_fence_fd) = out_fence_fd {
-            if let Ok(prop) = crtc_prop_handle(&prop_mapping, self.crtc, "OUT_FENCE_PTR") {
+            if let Ok(prop) = prop_mapping.crtc_prop_handle(self.crtc, "OUT_FENCE_PTR") {
                 // TODO Strict pointer provenance?
                 req.add_property(
                     self.crtc,

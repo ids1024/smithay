@@ -2740,6 +2740,7 @@ where
             user_data,
         });
         if self.pending_frame.is_none() {
+            // TODO expose out fence?
             self.submit()?;
         }
         Ok(())
@@ -2846,13 +2847,14 @@ where
             // TODO actually, want to use out fence before waiting for submitted?
             dbg!(out_fence_fd);
             std::mem::swap(&mut frame, &mut self.current_frame);
-            for plane in frame.planes.values() {
+            for (_, plane) in &frame.planes {
                 // TODO need to block release of *previous* frame buffers on out_fence_fd
                 if let Some(config) = plane.config.as_ref() {
                     //config.buffer.foo();
                 }
             }
             if self.queued_frame.is_some() {
+                // TODO expose out fence in some way
                 self.submit()?;
             }
             Ok(Some(user_data))
