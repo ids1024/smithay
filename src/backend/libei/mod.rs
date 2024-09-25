@@ -515,7 +515,7 @@ fn convert_request(request: EisRequest) -> Option<InputEvent<EiInput>> {
         EisRequest::TouchDown(event) => Some(InputEvent::TouchDown { event }),
         EisRequest::TouchUp(event) => Some(InputEvent::TouchUp { event }),
         EisRequest::TouchMotion(event) => Some(InputEvent::TouchMotion { event }),
-        EisRequest::Frame(_) => None, // TODO
+        EisRequest::Frame(_) => None,
         EisRequest::Disconnect
         | EisRequest::Bind(_)
         | EisRequest::DeviceStartEmulating(_)
