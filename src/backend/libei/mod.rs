@@ -10,14 +10,13 @@
 // re-export listener source?
 
 use calloop::{EventSource, PostAction, Readiness, Token, TokenFactory};
-use once_cell::sync::Lazy;
 use reis::{
     calloop::EisRequestSourceEvent,
     eis::{self, device::DeviceType},
     request::{self, Connection, DeviceCapability, EisRequest},
 };
 use rustix::fd::AsFd;
-use std::{collections::HashMap, ffi::CStr, io, path::PathBuf};
+use std::{ffi::CStr, io, path::PathBuf};
 use xkbcommon::xkb;
 
 use crate::{
@@ -25,22 +24,6 @@ use crate::{
     input::keyboard::XkbConfig,
     utils::SealedFile,
 };
-
-static SERVER_INTERFACES: Lazy<HashMap<&'static str, u32>> = Lazy::new(|| {
-    let mut m = HashMap::new();
-    m.insert("ei_callback", 1);
-    m.insert("ei_connection", 1);
-    m.insert("ei_seat", 1);
-    m.insert("ei_device", 1);
-    m.insert("ei_pingpong", 1);
-    m.insert("ei_keyboard", 1);
-    m.insert("ei_pointer", 1);
-    m.insert("ei_pointer_absolute", 1);
-    m.insert("ei_button", 1);
-    m.insert("ei_scroll", 1);
-    m.insert("ei_touchscreen", 1);
-    m
-});
 
 struct SenderState {
     name: Option<String>,
