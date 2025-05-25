@@ -77,7 +77,9 @@ impl fmt::Debug for UdevBackend {
 
 impl AsFd for UdevBackend {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.monitor.as_fd()
+        use io_lifetimes::AsFd;
+        use rustix::fd::AsRawFd;
+        unsafe { BorrowedFd::borrow_raw(self.monitor.as_fd().as_raw_fd()) }
     }
 }
 
