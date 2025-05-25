@@ -59,6 +59,7 @@ pub struct DrmSyncPoint {
 impl DrmSyncPoint {
     /// Create an eventfd that will be signaled by the syncpoint
     pub fn eventfd(&self) -> io::Result<OwnedFd> {
+        /*
         let fd = rustix::event::eventfd(
             0,
             rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
@@ -68,6 +69,8 @@ impl DrmSyncPoint {
             .device
             .syncobj_eventfd(self.timeline.0.syncobj, self.point, fd.as_fd(), false)?;
         Ok(fd)
+        */
+        panic!()
     }
 
     /// Signal the sync point.
