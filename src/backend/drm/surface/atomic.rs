@@ -966,13 +966,13 @@ impl AtomicDrmSurface {
         let mut req = AtomicRequest::new(&prop_mapping);
         // reset all planes we used
         for plane in self.used_planes.lock().unwrap().iter() {
-            req.reset_plane(*plane)?;
+            // req.reset_plane(*plane)?;
         }
 
         // disable connectors again
         let current = self.state.read().unwrap();
         for conn in current.connectors.iter() {
-            req.reset_connector(*conn)?;
+            // req.reset_connector(*conn)?;
         }
 
         // disable crtc
@@ -1196,7 +1196,7 @@ impl<'a> AtomicRequest<'a> {
         let crtc_props = self.crtc_props.entry(crtc).or_default();
 
         crtc_props.insert("ACTIVE", property::Value::Boolean(false));
-        crtc_props.insert("MODE_ID", property::Value::Blob(0));
+        // crtc_props.insert("MODE_ID", property::Value::Blob(0));
         if self.mapping.crtc_prop_handle(crtc, "VRR_ENABLED").is_ok() {
             crtc_props.insert("VRR_ENABLED", property::Value::Boolean(false));
         }
